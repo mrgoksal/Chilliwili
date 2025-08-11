@@ -17,8 +17,8 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-ADMIN_BOT_TOKEN = "8466893643:AAFJGHuMBZXSN4wQaW4sgfVbIO7H70PrHWs"
-ADMIN_USER_ID = 555469646
+ADMIN_BOT_TOKEN = "API"
+ADMIN_USER_ID = TGID
 
 def notify_admin(text):
     url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
