@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ЧиллиВили - Бронирование</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Заголовок -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🏠</span>
+                <h1>ЧиллиВили</h1>
+            </div>
+            <div class="user-info">
+                <span id="user-name">Гость</span>
+                <select id="role-select" class="role-select">
+                    <option value="guest">Гость</option>
+                    <option value="admin">Админ</option>
+                </select>
+            </div>
+        </header>
+
+        <!-- Главный экран -->
+        <main class="main-content">
+            <!-- Админ-панель -->
+            <div id="admin-panel" class="admin-panel" style="display: block;">
+                <h3>Админ-панель</h3>
+                <div class="admin-date-filter">
+                    <label for="admin-date-input">Дата:</label>
+                    <input type="date" id="admin-date-input">
+                    <button id="admin-date-filter-btn">Показать</button>
+                    <button id="admin-date-clear-btn">Сбросить</button>
+                </div>
+                <div id="admin-bookings-list" class="admin-bookings-list">
+                    <div class="loading">Загрузка...</div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Навигация -->
+        <nav class="bottom-nav">
+            <button class="nav-btn active" data-section="booking">
+                <span class="nav-icon">🏠</span>
+                <span>Бронирование</span>
+            </button>
+            <button class="nav-btn" data-section="bookings">
+                <span class="nav-icon">📝</span>
+                <span>Мои брони</span>
+            </button>
+            <button class="nav-btn" data-section="info">
+                <span class="nav-icon">ℹ️</span>
+                <span>Информация</span>
+            </button>
+        </nav>
+    </div>
+
+    <!-- Модальные окна -->
+    <div id="success-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>✅ Бронирование подтверждено!</h3>
+            </div>
+            <div class="modal-body">
+                <div id="booking-details"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="closeModal()">Отлично!</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для входа администратора -->
+    <div id="admin-login-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <span id="close-admin-login" class="close">&times;</span>
+            <h3>Вход администратора</h3>
+            <div class="form-group">
+                <label for="admin-username">Логин</label>
+                <input type="text" id="admin-username" class="form-control" placeholder="admin">
+            </div>
+            <div class="form-group">
+                <label for="admin-password">Пароль</label>
+                <input type="password" id="admin-password" class="form-control" placeholder="admin">
+            </div>
+            <button id="admin-login-btn" class="btn btn-primary">Войти</button>
+            <div id="admin-login-error" style="color:red; margin-top:10px; display:none;"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html> 
