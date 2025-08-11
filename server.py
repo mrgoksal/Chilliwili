@@ -30,7 +30,7 @@ def notify_admin(text):
     except Exception as e:
         print(f"[admin notify error] {e}")
 
-MAIN_BOT_TOKEN = "8301933923:AAEWob9zepOD9bm-gIby59ldmlBq3SHmzWg"
+MAIN_BOT_TOKEN = "API"
 def notify_user(user_id, text):
     url = f"https://api.telegram.org/bot{MAIN_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": user_id, "text": text}
