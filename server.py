@@ -18,7 +18,7 @@ def get_db():
     return conn
 
 ADMIN_BOT_TOKEN = "API"
-ADMIN_USER_ID = TGID
+ADMIN_USER_ID = "ADMIN_USER_ID"
 
 def notify_admin(text):
     url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
