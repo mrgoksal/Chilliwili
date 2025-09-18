@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, date, timedelta
 import json
 import aiohttp
-
+from db import init_db
 # Загрузка .env (если установлен python-dotenv)
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -231,7 +231,8 @@ async def get_all_admins():
             return await cursor.fetchall()
 
 async def main():
-    await init_admin_db()
+    await init_db()  # Инициализируем основные таблицы БД
+    await init_admin_db()  # Инициализируем таблицу администраторов
     bot = Bot(token=ADMIN_BOT_TOKEN)
     dp = Dispatcher()
 
