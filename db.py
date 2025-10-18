@@ -1,4 +1,5 @@
 import aiosqlite
+import sqlite3
 from typing import Optional, List, Dict
 from datetime import datetime, date, timedelta
 
@@ -14,6 +15,7 @@ async def init_db():
                 name TEXT NOT NULL,
                 phone TEXT,
                 telegram_id INTEGER UNIQUE,
+                username TEXT,
                 created_at TEXT
             )
         ''')
@@ -52,6 +54,14 @@ async def init_db():
         ''')
         
         await db.commit()
+        
+        # Миграция: добавляем колонку username если её нет
+        try:
+            await db.execute('ALTER TABLE users ADD COLUMN username TEXT')
+            await db.commit()
+        except sqlite3.OperationalError:
+            # Колонка уже существует, игнорируем ошибку
+            pass
         
         # Добавляем базовые временные слоты
         times = ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00', '22:00']

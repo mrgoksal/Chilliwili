@@ -8,7 +8,8 @@ import sqlite3
 from datetime import datetime, date, timedelta
 import json
 import aiohttp
-from db import init_db
+from db import init_db, DB_PATH
+
 # Загрузка .env (если установлен python-dotenv)
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -35,7 +36,7 @@ admin_states = {}
 
 def get_db():
     """Синхронное подключение к базе данных"""
-    conn = sqlite3.connect('chillivili.db')
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -69,7 +70,7 @@ def create_admin_menu():
 async def get_today_bookings():
     """Получить бронирования на сегодня"""
     today = date.today().strftime("%Y-%m-%d")
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT b.*, u.name, u.phone, u.telegram_id 
             FROM bookings b 
@@ -81,7 +82,7 @@ async def get_today_bookings():
 
 async def get_all_bookings(limit=50):
     """Получить все бронирования"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT b.*, u.name, u.phone, u.telegram_id, u.username 
             FROM bookings b 
@@ -94,7 +95,7 @@ async def get_all_bookings(limit=50):
 
 async def get_booking_by_id(booking_id):
     """Получить бронирование по ID"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT b.*, u.name, u.phone, u.telegram_id, u.username 
             FROM bookings b 
@@ -105,7 +106,7 @@ async def get_booking_by_id(booking_id):
 
 async def get_statistics():
     """Получить статистику"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         # Общая статистика
         async with db.execute("SELECT COUNT(*) FROM bookings WHERE status != 'cancelled'") as cursor:
             total_bookings = (await cursor.fetchone())[0]
@@ -181,7 +182,7 @@ def create_booking_keyboard(booking_id, actions=['confirm', 'cancel', 'edit', 'd
 
 async def init_admin_db():
     """Инициализация таблицы администраторов"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,21 +208,21 @@ async def init_admin_db():
 
 async def is_admin(telegram_id: int) -> bool:
     """Проверить, является ли пользователь администратором"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM admins WHERE telegram_id = ?", (telegram_id,)) as cursor:
             count = (await cursor.fetchone())[0]
             return count > 0
 
 async def is_super_admin(telegram_id: int) -> bool:
     """Проверить, является ли пользователь супер-администратором"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT role FROM admins WHERE telegram_id = ?", (telegram_id,)) as cursor:
             result = await cursor.fetchone()
             return result and result[0] == 'super_admin'
 
 async def get_all_admins():
     """Получить список всех администраторов"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT a.*, creator.name as created_by_name 
             FROM admins a 
@@ -348,7 +349,7 @@ async def main():
             return
         
         # Показываем бронирования со статусом "pending" для подтверждения
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 SELECT b.*, u.name, u.phone, u.telegram_id 
                 FROM bookings b 
@@ -388,7 +389,7 @@ async def main():
             return
         
         # Показываем активные бронирования для отмены
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 SELECT b.*, u.name, u.phone, u.telegram_id 
                 FROM bookings b 
@@ -504,7 +505,7 @@ async def main():
         
         if user_input.startswith("@"):  # Поиск по username
             username = user_input[1:].lower()
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute("SELECT telegram_id FROM users WHERE LOWER(username) = ?", (username,)) as cursor:
                     row = await cursor.fetchone()
                     if row:
@@ -556,7 +557,7 @@ async def main():
             formatted_date = date_obj.strftime("%Y-%m-%d")
             
             # Обновляем дату в базе данных
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE bookings SET date = ? WHERE id = ?", (formatted_date, booking_id))
                 await db.commit()
             
@@ -593,7 +594,7 @@ async def main():
             formatted_time = time_obj.strftime("%H:%M")
             
             # Обновляем время в базе данных
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE bookings SET time = ? WHERE id = ?", (formatted_time, booking_id))
                 await db.commit()
             
@@ -631,7 +632,7 @@ async def main():
                 return
             
             # Обновляем количество гостей в базе данных
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE bookings SET guests = ? WHERE id = ?", (guests, booking_id))
                 await db.commit()
             
@@ -669,7 +670,7 @@ async def main():
                 return
             
             # Обновляем длительность в базе данных
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE bookings SET duration = ? WHERE id = ?", (duration, booking_id))
                 await db.commit()
             
@@ -707,7 +708,7 @@ async def main():
                 return
             
             # Обновляем стоимость в базе данных
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE bookings SET total_price = ? WHERE id = ?", (price, booking_id))
                 await db.commit()
             
@@ -749,7 +750,7 @@ async def main():
                 return
             
             # Добавляем нового администратора
-            async with aiosqlite.connect("chillivili.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
                     "INSERT INTO admins (telegram_id, username, name, role, created_at, created_by) VALUES (?, ?, ?, 'admin', ?, ?)",
                     (new_admin_id, "new_admin", f"Администратор {new_admin_id}", datetime.now().isoformat(), message.from_user.id)
@@ -813,7 +814,7 @@ async def main():
         
         booking_id = int(callback.data.split("_")[1])
         
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 UPDATE bookings SET status = 'confirmed' WHERE id = ?
             """, (booking_id,)) as cursor:
@@ -847,7 +848,7 @@ async def main():
         
         booking_id = int(callback.data.split("_")[1])
         
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
                 UPDATE bookings SET status = 'cancelled' WHERE id = ?
             """, (booking_id,)) as cursor:
@@ -932,7 +933,7 @@ async def main():
         
         booking_id = int(callback.data.split("_")[1])
         
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("DELETE FROM bookings WHERE id = ?", (booking_id,)) as cursor:
                 await db.commit()
                 
@@ -1036,7 +1037,7 @@ async def main():
         admin_id = int(callback.data.split("_")[2])
         
         # Удаляем администратора из базы данных
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM admins WHERE telegram_id = ?", (admin_id,))
             await db.commit()
         

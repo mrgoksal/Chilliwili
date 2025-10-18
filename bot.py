@@ -9,6 +9,7 @@ from datetime import datetime, date, timedelta
 import json
 import aiohttp
 from calendar import monthrange
+from db import DB_PATH
 
 # Загрузка .env (если установлен python-dotenv)
 try:
@@ -30,19 +31,19 @@ WEBAPP_URL = "https://628164fc148f.ngrok-free.app/"
 
 def get_db():
     """Синхронное подключение к базе данных"""
-    conn = sqlite3.connect('chillivili.db')
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 async def init_db():
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE,
-                username TEXT,
                 name TEXT,
                 phone TEXT,
+                telegram_id INTEGER UNIQUE,
+                username TEXT,
                 created_at TEXT
             )
         ''')
@@ -69,29 +70,41 @@ async def init_db():
         ''')
         await db.commit()
         
+        # Миграция: обновляем NULL значения в поле name
+        try:
+            await db.execute("UPDATE users SET name = 'Пользователь' WHERE name IS NULL")
+            await db.commit()
+        except Exception as e:
+            print(f"Migration error: {e}")
+        
         # Добавляем временные слоты если их нет
         async with db.execute("SELECT COUNT(*) FROM time_slots") as cursor:
             count = (await cursor.fetchone())[0]
             if count == 0:
-                # Слоты с 11:00 до 23:00 включительно
+                # Слоты с 00:00 до 23:00 включительно
                 time_slots = []
-                for hour in range(11, 24):
+                for hour in range(0, 24):
                     time_slots.append(f"{hour:02d}:00")
                 for time_slot in time_slots:
                     await db.execute("INSERT INTO time_slots (time) VALUES (?)", (time_slot,))
                 await db.commit()
 
 async def get_or_create_user(telegram_id: int, username: str = None, name: str = None):
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
             user = await cursor.fetchone()
             if not user:
+                # Если name не передан, используем "Пользователь" как значение по умолчанию
+                user_name = name if name else "Пользователь"
                 await db.execute(
-                    "INSERT INTO users (telegram_id, username, name, created_at) VALUES (?, ?, ?, ?)",
-                    (telegram_id, username, name, datetime.now().isoformat())
+                    "INSERT INTO users (telegram_id, username, name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (telegram_id, username, user_name, None, datetime.now().isoformat())
                 )
                 await db.commit()
-                return await db.execute("SELECT last_insert_rowid()")
+                # Получаем ID созданного пользователя
+                async with db.execute("SELECT last_insert_rowid()") as cursor:
+                    user_id = (await cursor.fetchone())[0]
+                    return user_id
             return user[0]
 
 async def get_available_dates():
@@ -104,7 +117,7 @@ async def get_available_dates():
 
 async def get_available_times(selected_date: str):
     """Получить доступные временные слоты для выбранной даты"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         # Получаем все временные слоты
         async with db.execute("SELECT time FROM time_slots ORDER BY time") as cursor:
             all_times = [row[0] for row in await cursor.fetchall()]
@@ -116,14 +129,39 @@ async def get_available_times(selected_date: str):
         """, (selected_date,)) as cursor:
             existing_bookings = await cursor.fetchall()
         
-        # Создаем множество заблокированных временных слотов (час ДО, сама бронь, час ПОСЛЕ)
+        # Получаем бронирования с предыдущего дня, которые могут продолжаться на текущий день
+        prev_date = (datetime.strptime(selected_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+        async with db.execute("""
+            SELECT time, duration FROM bookings 
+            WHERE date = ? AND status != 'cancelled'
+        """, (prev_date,)) as cursor:
+            prev_day_bookings = await cursor.fetchall()
+        
+        # Создаем множество заблокированных временных слотов
         blocked_times = set()
+        
+        # Блокируем времена для бронирований текущего дня
         for booking_time, booking_duration in existing_bookings:
             start_time = datetime.strptime(booking_time, '%H:%M')
-            # Блокируем с (start - 1ч) до (end + 1ч) невключительно
-            for i in range(-1, booking_duration + 1):
+            # Блокируем только саму бронь + час ПОСЛЕ
+            for i in range(0, booking_duration + 1):
                 blocked_time = start_time + timedelta(hours=i)
-                blocked_times.add(blocked_time.strftime('%H:%M'))
+                # Блокируем только время, которое не переходит через полночь в прошлое
+                if blocked_time.hour >= start_time.hour:
+                    blocked_times.add(blocked_time.strftime('%H:%M'))
+        
+        # Блокируем времена для бронирований предыдущего дня, которые продолжаются на текущий день
+        for booking_time, booking_duration in prev_day_bookings:
+            start_time = datetime.strptime(booking_time, '%H:%M')
+            end_time = start_time + timedelta(hours=booking_duration)
+            
+            # Если бронирование заканчивается после полуночи, блокируем время на следующий день
+            if end_time.hour > 0 or (end_time.hour == 0 and end_time.minute > 0):
+                # Блокируем время с 00:00 до времени окончания + 1 час буфера
+                # Для бронирования 23:00 на 24 часа: end_time = 23:00, блокируем 00:00-23:00
+                end_hour = end_time.hour if end_time.minute == 0 else end_time.hour + 1
+                for hour in range(0, min(end_hour + 1, 24)):  # +1 для буфера уборки
+                    blocked_times.add(f"{hour:02d}:00")
         
         # Фильтруем слоты по правилу "бронь не раньше чем за 1 час" для сегодняшней даты
         available = [time for time in all_times if time not in blocked_times]
@@ -167,40 +205,15 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
             )
             user_id = cur.lastrowid
         
-        # Расчет стоимости по новой системе (цена за время, а не за гостей)
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
-        is_weekend = date_obj.weekday() >= 5  # Суббота и воскресенье
+        # Расчет стоимости по новой системе: 800р/час до 8 человек, +500р за каждого сверх 8 человек
+        base_price_per_hour = 800
+        total_price = base_price_per_hour * duration
         
-        # Определяем тариф в зависимости от времени и дня недели
-        time_obj = datetime.strptime(time, "%H:%M")
-        hour = time_obj.hour
-        
-        # Рассчитываем стоимость по часам с учетом разных тарифов
-        total_price = 0
-        current_time = time_obj
-        
-        for i in range(duration):
-            current_hour = current_time.hour
-            
-            # Определяем тариф для текущего часа
-            if current_hour >= 23:
-                # После 23:00 фиксированная цена
-                price_per_hour = 1500
-            elif is_weekend:
-                # Выходные и праздники
-                if 11 <= current_hour < 18:
-                    price_per_hour = 1000
-                else:  # 18:00 - 22:59
-                    price_per_hour = 1300
-            else:
-                # Будни
-                if 11 <= current_hour < 18:
-                    price_per_hour = 800
-                else:  # 18:00 - 22:59
-                    price_per_hour = 1000
-            
-            total_price += price_per_hour
-            current_time += timedelta(hours=1)
+        # Добавляем доплату за гостей сверх 8 человек
+        if guests > 8:
+            extra_guests = guests - 8
+            extra_charge = extra_guests * 500  # 500р за каждого сверх 8 человек на всё время
+            total_price += extra_charge
         
         # Проверяем доступность времени
         cur.execute("""
@@ -209,29 +222,50 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         """, (date,))
         existing_bookings = cur.fetchall()
         
+        # Проверяем бронирования с предыдущего дня, которые могут продолжаться на текущий день
+        prev_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+        cur.execute("""
+            SELECT time, duration FROM bookings 
+            WHERE date = ? AND status != 'cancelled'
+        """, (prev_date,))
+        prev_day_bookings = cur.fetchall()
+        
         # Проверяем пересечения с учетом буфера ДО и ПОСЛЕ (1 час)
         booking_start = datetime.strptime(time, '%H:%M')
         booking_end = booking_start + timedelta(hours=duration)
+        
+        # Проверяем пересечения с бронированиями текущего дня
         for existing_time, existing_duration in existing_bookings:
             exist_start = datetime.strptime(existing_time, '%H:%M')
             exist_end = exist_start + timedelta(hours=existing_duration)
-            # Диапазон с буфером: [exist_start - 1ч, exist_end + 1ч)
-            buffer_start = exist_start - timedelta(hours=1)
+            
+            # Проверяем пересечение с самой бронью + час ПОСЛЕ
             buffer_end = exist_end + timedelta(hours=1)
-            # Пересечение?
-            if booking_start < buffer_end and booking_end > buffer_start:
-                # Определяем причину
-                if booking_start < exist_end and booking_end > exist_start:
-                    reason = "В это время уже есть другое бронирование!"
-                elif booking_start < exist_start and booking_end > buffer_start and booking_end <= exist_start:
-                    reason = "Требуется 1 час на уборку перед следующим бронированием!"
-                elif booking_start >= exist_end and booking_start < buffer_end:
-                    reason = "Требуется 1 час на уборку после предыдущего бронирования!"
-                else:
-                    reason = "Время занято или требуется уборка между бронированиями!"
+            if booking_start < buffer_end and booking_end > exist_start:
+                reason = "В это время уже есть другое бронирование!"
                 await message.answer(f"❌ {reason} Пожалуйста, выберите другое время.")
                 conn.close()
                 return
+        
+        # Проверяем пересечения с бронированиями предыдущего дня
+        for existing_time, existing_duration in prev_day_bookings:
+            exist_start = datetime.strptime(existing_time, '%H:%M')
+            exist_end = exist_start + timedelta(hours=existing_duration)
+            
+            # Если бронирование предыдущего дня заканчивается после полуночи
+            if exist_end.hour > 0 or (exist_end.hour == 0 and exist_end.minute > 0):
+                # Проверяем пересечение с временем на следующий день
+                next_day_start = datetime.strptime("00:00", '%H:%M')
+                next_day_end = exist_end
+                buffer_start = next_day_start - timedelta(hours=1)
+                buffer_end = next_day_end + timedelta(hours=1)
+                
+                # Пересечение?
+                if booking_start < buffer_end and booking_end > buffer_start:
+                    reason = "В это время помещение занято бронированием с предыдущего дня!"
+                    await message.answer(f"❌ {reason} Пожалуйста, выберите другое время.")
+                    conn.close()
+                    return
         
 
         
@@ -244,14 +278,22 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         booking_id = cur.lastrowid
         conn.close()
         
+        # Формируем информацию о стоимости
+        price_info = f"💰 Стоимость: {total_price}₽"
+        if guests > 8:
+            extra_guests = guests - 8
+            price_info += f"\n   (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+        else:
+            price_info += f"\n   (800₽/час)"
+        
         # Уведомляем пользователя о создании бронирования (ожидает подтверждения)
         await message.answer(
-            f"⏳ **Бронирование создано и ожидает подтверждения!**\n\n"
+            f"⏳ Бронирование создано и ожидает подтверждения!\n\n"
             f"📅 Дата: {date}\n"
             f"🕐 Время: {time}\n"
             f"👥 Гости: {guests}\n"
             f"⏱ Длительность: {duration} ч.\n"
-            f"💰 Стоимость: {total_price}₽ (за время)\n\n"
+            f"{price_info}\n\n"
             f"🆔 ID брони: {booking_id}\n\n"
             f"📞 Мы свяжемся с вами для подтверждения бронирования!"
         )
@@ -274,7 +316,21 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         else:
             tg_tag = f"tg://user?id={message.from_user.id}"
         # Вычисляем время окончания
-        end_time = (datetime.strptime(time, '%H:%M') + timedelta(hours=duration)).strftime('%H:%M')
+        start_time = datetime.strptime(time, '%H:%M')
+        end_time_obj = start_time + timedelta(hours=duration)
+        # Если время переходит через полночь, показываем следующий день
+        if end_time_obj.day > start_time.day:
+            end_time = f"{end_time_obj.strftime('%H:%M')} (+1 день)"
+        else:
+            end_time = end_time_obj.strftime('%H:%M')
+        # Формируем информацию о стоимости для админа
+        admin_price_info = f"💰 Стоимость: {total_price}₽"
+        if guests > 8:
+            extra_guests = guests - 8
+            admin_price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+        else:
+            admin_price_info += f" (800₽/час)"
+        
         # Уведомляем админа
         await notify_admin(
             f"🆕 Новая заявка из бота!\n"
@@ -287,7 +343,7 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
             f"⏰ Окончание: {end_time}\n"
             f"👥 Гости: {guests}\n"
             f"⏱ Длительность: {duration} ч.\n"
-            f"💰 Стоимость: {total_price}₽ (за время)\n"
+            f"{admin_price_info}\n"
             f"🆔 ID брони: {booking_id}")
         
     except Exception as e:
@@ -296,7 +352,7 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
 
 async def get_user_bookings(user_id: int):
     """Получить бронирования пользователя"""
-    async with aiosqlite.connect("chillivili.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT * FROM bookings 
             WHERE user_id = ? AND status != 'cancelled'
@@ -412,14 +468,15 @@ def create_time_keyboard(times):
 def create_guests_keyboard():
     """Создать клавиатуру с количеством гостей"""
     keyboard = []
-    for i in range(1, 11):  # От 1 до 10 гостей
+    for i in range(1, 16):  # От 1 до 15 гостей
         keyboard.append([InlineKeyboardButton(text=str(i), callback_data=f"guests_{i}")])
+    keyboard.append([InlineKeyboardButton(text="И более", callback_data="guests_more")])
     keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def create_duration_keyboard():
     """Создать клавиатуру с длительностью"""
-    durations = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # От 1 до 12 часов
+    durations = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # От 1 до 24 часов
     keyboard = []
     for duration in durations:
         text = f"{duration} час{'а' if duration in [2,3,4] else 'ов' if duration > 4 else ''}"
@@ -475,7 +532,7 @@ async def main():
 
     @dp.message(Command("start"))
     async def cmd_start(message: types.Message):
-        await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+        await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.full_name or "Пользователь")
         
         welcome_text = f"""
 🏠 Добро пожаловать в антикафе «ЧиллиВили»!
@@ -487,26 +544,20 @@ async def main():
 
 В ЧиллиВили не нужно выбирать между капучино и уютом. У нас всё просто: ты платишь только за время, а внутри тебя уже ждут:
 
-✔️ Чай, кофе, вода
-✔️ Печеньки и лёгкие снеки  
 ✔️ Настольные игры, приставки, уютные зоны
 ✔️ Wi-Fi и зарядки
 ✔️ Атмосфера — как дома, только лучше
+✔️ Микрофоны что бы покричать караоке
 
-🗓 Будни (Пн–Пт)
-🕒 С 11:00 до 18:00 — 800 ₽ / час
-🕔 С 18:00 до 23:00 — 1000 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
-
-🏖 Выходные и праздники
-🕒 С 11:00 до 18:00 — 1000 ₽ / час
-🕔 С 18:00 до 23:00 — 1300 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
+💰 Цены:
+🕒 800 ₽ / час до 8 человек
+👥 +500 ₽ за каждого человека сверх 8 человек (на всё время пребывания)
 
 ❗Минимальное посещение — 1 час
 ❗Оплата почасовая (всё честно — ты платишь только за то, сколько был)
 
-📍 Мы работаем каждый день с 11:00 до 23:00 (бронирования могут заканчиваться позже)
+📍 Часы работы: по договоренности
+📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
 
 Выберите действие из меню ниже:
         """
@@ -554,10 +605,21 @@ async def main():
         for booking in bookings:
             date_obj = datetime.strptime(booking[2], "%Y-%m-%d")
             display_date = date_obj.strftime("%d.%m.%Y")
+            guests = booking[4]
+            total_price = booking[6]
+            
+            # Формируем информацию о стоимости
+            price_info = f"💰 {total_price} ₽"
+            if guests > 8:
+                extra_guests = guests - 8
+                price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+            else:
+                price_info += f" (800₽/час)"
+            
             text += f"📅 {display_date} в {booking[3]}\n"
-            text += f"👥 {booking[4]} гостей\n"
+            text += f"👥 {guests} гостей\n"
             text += f"⏱ {booking[5]} час{'а' if booking[5] in [2,3,4] else 'ов' if booking[5] > 4 else ''}\n"
-            text += f"💰 {booking[6]} ₽ (за время)\n"
+            text += f"{price_info}\n"
             text += f"📋 ID: {booking[0]}\n\n"
         
         await message.answer(text)
@@ -578,25 +640,19 @@ async def main():
         info_text = """
 🏠 Антикафе «ЧиллиВили»
 
+📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
 📍 Адрес: ул. Современная, 5
 📞 Телефон: +7 (951) 353-44-35
 🌐 Сайт: https://vk.com/chilivilivili?from=groups
 
-🕐 Часы работы:
-Каждый день с 11:00 до 23:00
+🕐 Часы работы: по договоренности
 
 💸 Наши актуальные цены
 — Платишь за время. Всё остальное — уже включено.
 
-🗓 Будни (Пн–Пт)
-🕒 С 11:00 до 18:00 — 800 ₽ / час
-🕔 С 18:00 до 23:00 — 1000 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
-
-🏖 Выходные и праздники
-🕒 С 11:00 до 18:00 — 1000 ₽ / час
-🕔 С 18:00 до 23:00 — 1300 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
+💰 Цены:
+🕒 800 ₽ / час до 8 человек
+👥 +500 ₽ за каждого человека сверх 8 человек (на всё время пребывания)
 
 ❗Минимальное посещение — 1 час
 ❗Оплата почасовая (всё честно — ты платишь только за то, сколько был)
@@ -605,18 +661,14 @@ async def main():
 ✅ Пространство для работы и отдыха
 ✅ Кино, приставки, настолки
 ✅ Идеальные условия для душевного вечера, уютного дня или спонтанной встречи
-✅ Чай, кофе, вода
-✅ Печеньки и лёгкие снеки
 ✅ Wi-Fi и зарядки
 ✅ Атмосфера — как дома, только лучше
+✅ Микрофоны что бы покричать караоке
 
 📋 Правила:
 • Бронирование за 2 часа
 • Отмена за 1 час
 • Оплата при входе
-• Максимум 12 часов
-
-📍 Мы работаем каждый день с 11:00 до 23:00 (бронирования могут заканчиваться позже)
 
 Загляни в ЧиллиВили — тут время действительно твоё.
 Только бронируй заранее, особенно в выходные 😉
@@ -636,32 +688,25 @@ async def main():
 💸 Наша ценовая политика:
 — Платишь за время. Всё остальное — уже включено.
 
-🗓 Будни (Пн–Пт)
-🕒 С 11:00 до 18:00 — 800 ₽ / час
-🕔 С 18:00 до 23:00 — 1000 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
-
-🏖 Выходные и праздники
-🕒 С 11:00 до 18:00 — 1000 ₽ / час
-🕔 С 18:00 до 23:00 — 1300 ₽ / час
-🌙 После 23:00 — 1500 ₽ / час
+💰 Цены:
+🕒 800 ₽ / час до 8 человек
+👥 +500 ₽ за каждого человека сверх 8 человек (на всё время пребывания)
 
 🛋 Что включено в стоимость:
 ✅ Пространство для работы и отдыха
-✅ Чай, кофе, вода
-✅ Печеньки и лёгкие снеки
 ✅ Настольные игры, приставки
 ✅ Wi-Fi и зарядки
 ✅ Атмосфера — как дома, только лучше
+✅ Микрофоны что бы покричать караоке
 
 📋 Важно:
 • Бронирование за 2 часа
 • Отмена за 1 час до времени
 • Оплата при входе
-• Минимум 1 час, максимум 12 часов
-• Оплата почасовая (за время, а не за гостей)
+• Минимум 1 час
+• Оплата почасовая 
 
-❓ Остались вопросы? Звоните: +7 (951) 353-44-35
+📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
         """
         await message.answer(help_text)
 
@@ -706,6 +751,24 @@ async def main():
 
     @dp.callback_query(F.data.regexp(r"^guests_"))
     async def handle_guests_selection(callback: types.CallbackQuery):
+        if callback.data == "guests_more":
+            # Обработка кнопки "И более"
+            user_id = await get_or_create_user(callback.from_user.id)
+            state = user_states.get(callback.from_user.id)
+            
+            if not state or state["state"] != "selecting_guests":
+                await callback.answer("❌ Ошибка")
+                return
+            
+            user_states[callback.from_user.id] = {
+                "state": "waiting_for_guests_count",
+                "date": state["date"],
+                "time": state["time"]
+            }
+            
+            await callback.message.edit_text("👥 Введите количество гостей (число):")
+            return
+        
         guests = int(callback.data.split("_")[1])
         user_id = await get_or_create_user(callback.from_user.id)
         state = user_states.get(callback.from_user.id)
@@ -742,6 +805,22 @@ async def main():
         }
         await callback.message.edit_text("✏️ Введите ваше имя для бронирования:")
 
+    @dp.message(lambda message: user_states.get(message.from_user.id, {}).get("state") == "waiting_for_guests_count")
+    async def handle_guests_count_input(message: types.Message):
+        try:
+            guests = int(message.text.strip())
+            if guests < 1:
+                await message.answer("❌ Количество гостей должно быть больше 0!")
+                return
+            state = user_states.get(message.from_user.id)
+            user_states[message.from_user.id]["guests"] = guests
+            user_states[message.from_user.id]["state"] = "selecting_duration"
+            
+            keyboard = create_duration_keyboard()
+            await message.answer("⏱ Выберите длительность посещения:", reply_markup=keyboard)
+        except ValueError:
+            await message.answer("❌ Пожалуйста, введите корректное число!")
+
     @dp.message(lambda message: user_states.get(message.from_user.id, {}).get("state") == "waiting_for_name")
     async def handle_name_input(message: types.Message):
         name = message.text.strip()
@@ -763,7 +842,7 @@ async def main():
         state = user_states.get(message.from_user.id)
         # Сохраняем имя и телефон в БД пользователя
         user_id = await get_or_create_user(message.from_user.id, name=state["name"])
-        async with aiosqlite.connect("chillivili.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET name = ?, phone = ? WHERE telegram_id = ?", (state["name"], phone, message.from_user.id))
             await db.commit()
         # Создаём бронирование
@@ -782,17 +861,81 @@ async def main():
     async def handle_cancel_booking_callback(callback: types.CallbackQuery):
         booking_id = int(callback.data.split("_")[-1])
         user_id = await get_or_create_user(callback.from_user.id)
-        async with aiosqlite.connect("chillivili.db") as db:
+        
+        # Получаем информацию о бронировании перед отменой
+        async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("""
-                UPDATE bookings 
-                SET status = 'cancelled' 
-                WHERE id = ? AND user_id = ? AND status != 'cancelled'
+                SELECT b.*, u.name, u.phone, u.username, u.telegram_id
+                FROM bookings b 
+                JOIN users u ON b.user_id = u.id 
+                WHERE b.id = ? AND b.user_id = ? AND b.status != 'cancelled'
             """, (booking_id, user_id)) as cursor:
-                await db.commit()
-                if cursor.rowcount > 0:
-                    await callback.message.edit_text("✅ Бронирование отменено!")
-                else:
+                booking_info = await cursor.fetchone()
+                
+                if not booking_info:
                     await callback.message.edit_text("❌ Бронирование не найдено или уже отменено")
+                    return
+                
+                # Отменяем бронирование
+                async with db.execute("""
+                    UPDATE bookings 
+                    SET status = 'cancelled' 
+                    WHERE id = ? AND user_id = ? AND status != 'cancelled'
+                """, (booking_id, user_id)) as cursor:
+                    await db.commit()
+                    
+                    if cursor.rowcount > 0:
+                        await callback.message.edit_text("✅ Бронирование отменено!")
+                        
+                        # Отправляем уведомление админу
+                        booking_date = booking_info[2]
+                        booking_time = booking_info[3]
+                        guests = booking_info[4]
+                        duration = booking_info[5]
+                        total_price = booking_info[6]
+                        user_name = booking_info[7]
+                        user_phone = booking_info[8]
+                        user_username = booking_info[9]
+                        user_telegram_id = booking_info[10]
+                        
+                        # Формируем тег пользователя
+                        if user_username:
+                            tg_tag = f"@{user_username}"
+                        else:
+                            tg_tag = f"tg://user?id={user_telegram_id}"
+                        
+                        # Формируем информацию о стоимости
+                        admin_price_info = f"💰 Стоимость: {total_price}₽"
+                        if guests > 8:
+                            extra_guests = guests - 8
+                            admin_price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+                        else:
+                            admin_price_info += f" (800₽/час)"
+                        
+                        # Вычисляем время окончания
+                        start_time = datetime.strptime(booking_time, '%H:%M')
+                        end_time_obj = start_time + timedelta(hours=duration)
+                        if end_time_obj.day > start_time.day:
+                            end_time = f"{end_time_obj.strftime('%H:%M')} (+1 день)"
+                        else:
+                            end_time = end_time_obj.strftime('%H:%M')
+                        
+                        await notify_admin(
+                            f"❌ **Бронирование отменено пользователем!**\n\n"
+                            f"👤 Имя: {user_name}\n"
+                            f"📞 Телефон: {user_phone}\n"
+                            f"Тег: {tg_tag}\n"
+                            f"🧩 TG ID: {user_telegram_id}\n"
+                            f"📅 Дата: {booking_date}\n"
+                            f"🕐 Время: {booking_time}\n"
+                            f"⏰ Окончание: {end_time}\n"
+                            f"👥 Гости: {guests}\n"
+                            f"⏱ Длительность: {duration} ч.\n"
+                            f"{admin_price_info}\n"
+                            f"🆔 ID брони: {booking_id}"
+                        )
+                    else:
+                        await callback.message.edit_text("❌ Бронирование не найдено или уже отменено")
 
     @dp.callback_query(F.data == "choose_other_date")
     async def handle_choose_other_date(callback: types.CallbackQuery):
