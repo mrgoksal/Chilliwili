@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta
 import json
 import aiohttp
 from calendar import monthrange
-from db import DB_PATH
+from db import DB_PATH, get_available_times as db_get_available_times, get_setting, get_media_setting, calculate_booking_price, get_price_per_hour, get_price_per_extra_guest, get_max_guests_included, get_all_admin_ids, OPEN_HOUR, CLOSE_HOUR, MAX_BOOKING_DURATION
 
 # Загрузка .env (если установлен python-dotenv)
 try:
@@ -36,6 +36,7 @@ def get_db():
     return conn
 
 async def init_db():
+    
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -105,6 +106,21 @@ async def get_or_create_user(telegram_id: int, username: str = None, name: str =
                 async with db.execute("SELECT last_insert_rowid()") as cursor:
                     user_id = (await cursor.fetchone())[0]
                     return user_id
+            else:
+                # Пользователь существует - обновляем имя и username, если они None или пустые
+                user_id = user[0]
+                current_name = user[1] if len(user) > 1 else None
+                current_username = user[3] if len(user) > 3 else None
+                
+                # Обновляем имя, если оно None или пустое
+                if (not current_name or current_name == "None" or current_name == "Пользователь") and name:
+                    await db.execute("UPDATE users SET name = ? WHERE telegram_id = ?", (name, telegram_id))
+                
+                # Обновляем username, если он None или пустой
+                if (not current_username or current_username == "None") and username:
+                    await db.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
+                
+                await db.commit()
             return user[0]
 
 async def get_available_dates():
@@ -115,105 +131,47 @@ async def get_available_dates():
         dates.append(date_obj.strftime("%Y-%m-%d"))
     return dates
 
-async def get_available_times(selected_date: str):
-    """Получить доступные временные слоты для выбранной даты"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем все временные слоты
-        async with db.execute("SELECT time FROM time_slots ORDER BY time") as cursor:
-            all_times = [row[0] for row in await cursor.fetchall()]
-        
-        # Получаем забронированные времена с длительностью для выбранной даты
-        async with db.execute("""
-            SELECT time, duration FROM bookings 
-            WHERE date = ? AND status != 'cancelled'
-        """, (selected_date,)) as cursor:
-            existing_bookings = await cursor.fetchall()
-        
-        # Получаем бронирования с предыдущего дня, которые могут продолжаться на текущий день
-        prev_date = (datetime.strptime(selected_date, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
-        async with db.execute("""
-            SELECT time, duration FROM bookings 
-            WHERE date = ? AND status != 'cancelled'
-        """, (prev_date,)) as cursor:
-            prev_day_bookings = await cursor.fetchall()
-        
-        # Создаем множество заблокированных временных слотов
-        blocked_times = set()
-        
-        # Блокируем времена для бронирований текущего дня
-        for booking_time, booking_duration in existing_bookings:
-            start_time = datetime.strptime(booking_time, '%H:%M')
-            # Блокируем только саму бронь + час ПОСЛЕ
-            for i in range(0, booking_duration + 1):
-                blocked_time = start_time + timedelta(hours=i)
-                # Блокируем только время, которое не переходит через полночь в прошлое
-                if blocked_time.hour >= start_time.hour:
-                    blocked_times.add(blocked_time.strftime('%H:%M'))
-        
-        # Блокируем времена для бронирований предыдущего дня, которые продолжаются на текущий день
-        for booking_time, booking_duration in prev_day_bookings:
-            start_time = datetime.strptime(booking_time, '%H:%M')
-            end_time = start_time + timedelta(hours=booking_duration)
-            
-            # Если бронирование заканчивается после полуночи, блокируем время на следующий день
-            if end_time.hour > 0 or (end_time.hour == 0 and end_time.minute > 0):
-                # Блокируем время с 00:00 до времени окончания + 1 час буфера
-                # Для бронирования 23:00 на 24 часа: end_time = 23:00, блокируем 00:00-23:00
-                end_hour = end_time.hour if end_time.minute == 0 else end_time.hour + 1
-                for hour in range(0, min(end_hour + 1, 24)):  # +1 для буфера уборки
-                    blocked_times.add(f"{hour:02d}:00")
-        
-        # Фильтруем слоты по правилу "бронь не раньше чем за 1 час" для сегодняшней даты
-        available = [time for time in all_times if time not in blocked_times]
-        today_str = date.today().strftime("%Y-%m-%d")
-        if selected_date == today_str:
-            now = datetime.now()
-            base = now.replace(minute=0, second=0, microsecond=0)
-            # Если ровно на час (минуты == 0), ближайший слот допускается только через 1 час
-            # Если уже идут минуты, ближайший допустимый полный час + ещё 1 час, чтобы соблюсти правило "за час"
-            earliest_dt = base + timedelta(hours=1 if now.minute == 0 else 2)
-            cutoff_str = earliest_dt.strftime('%H:%M')
-            available = [t for t in available if t >= cutoff_str]
-        
-        return available
 
-async def create_booking(message: types.Message, date: str, time: str, guests: int, duration: int):
-    """Создание бронирования через бота"""
+async def create_booking(message: types.Message, date: str, time: str, guests: int, duration: int, booking_name: str = None, booking_phone: str = None):
+    """Создание бронирования через бота
+    
+    Args:
+        booking_name: Имя для бронирования (если указано, сохраняется в notes, не перезаписывает имя пользователя)
+        booking_phone: Телефон для бронирования (если указано, сохраняется в notes, не перезаписывает телефон пользователя)
+    """
     try:
         # Получаем информацию о пользователе
-        user_id = message.from_user.id
+        telegram_id = message.from_user.id
         user_name = message.from_user.full_name
-        user_phone = "Не указан"  # В боте нет поля для телефона
         
-        # Создаем или получаем пользователя
+        # Создаем или получаем пользователя (без обновления имени и телефона)
         conn = get_db()
         cur = conn.cursor()
         
         # Ищем пользователя по Telegram ID
-        cur.execute("SELECT id, name, phone FROM users WHERE telegram_id = ?", (user_id,))
+        cur.execute("SELECT id, name, phone FROM users WHERE telegram_id = ?", (telegram_id,))
         user = cur.fetchone()
         
         if user:
             db_user_id, db_name, db_phone = user
-            # Не обновляем имя из Telegram, используем то, что сохранено в боте
             user_id = db_user_id
         else:
-            # Создаем нового пользователя (временно ставим Telegram имя, позже будет обновлено введенным)
+            # Создаем нового пользователя с Telegram именем
             cur.execute(
                 "INSERT INTO users (name, phone, telegram_id, created_at) VALUES (?, ?, ?, ?)",
-                (user_name, user_phone, message.from_user.id, datetime.now().isoformat())
+                (user_name, "Не указан", telegram_id, datetime.now().isoformat())
             )
             user_id = cur.lastrowid
         
-        # Расчет стоимости по новой системе: 800р/час до 8 человек, +500р за каждого сверх 8 человек
-        base_price_per_hour = 800
-        total_price = base_price_per_hour * duration
+        # Для notes ВСЕГДА используем данные, которые ввел пользователь (booking_name, booking_phone)
+        # Эти данные передаются из handle_phone_input и содержат имя и телефон, которые пользователь ВВЕЛ
+        # НЕ используем данные из таблицы users, чтобы каждая бронь была уникальной
+        # Если booking_name/booking_phone не указаны (что не должно происходить), используем Telegram профиль как fallback
+        display_name = booking_name if booking_name else user_name
+        display_phone = booking_phone if booking_phone else "Не указан"
         
-        # Добавляем доплату за гостей сверх 8 человек
-        if guests > 8:
-            extra_guests = guests - 8
-            extra_charge = extra_guests * 500  # 500р за каждого сверх 8 человек на всё время
-            total_price += extra_charge
+        # Расчет стоимости с использованием настроек цен
+        total_price = await calculate_booking_price(guests, duration)
         
         # Проверяем доступность времени
         cur.execute("""
@@ -233,15 +191,33 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         # Проверяем пересечения с учетом буфера ДО и ПОСЛЕ (1 час)
         booking_start = datetime.strptime(time, '%H:%M')
         booking_end = booking_start + timedelta(hours=duration)
+
+        if booking_start.hour < OPEN_HOUR or booking_start.hour >= CLOSE_HOUR:
+            await message.answer("❌ Забронировать можно только с 10:00 до 22:00. Выберите другое время.")
+            conn.close()
+            return
+
+        closing_datetime = booking_start.replace(hour=CLOSE_HOUR, minute=0)
+        if booking_end > closing_datetime:
+            max_hours = CLOSE_HOUR - booking_start.hour
+            await message.answer(
+                f"❌ Бронирование должно завершаться до {CLOSE_HOUR:02d}:00. "
+                f"Для этого времени доступно максимум {max_hours} ч."
+            )
+            conn.close()
+            return
         
         # Проверяем пересечения с бронированиями текущего дня
         for existing_time, existing_duration in existing_bookings:
             exist_start = datetime.strptime(existing_time, '%H:%M')
             exist_end = exist_start + timedelta(hours=existing_duration)
             
-            # Проверяем пересечение с самой бронью + час ПОСЛЕ
-            buffer_end = exist_end + timedelta(hours=1)
-            if booking_start < buffer_end and booking_end > exist_start:
+            # Проверяем пересечение с учетом зазора ДО (1 час) и ПОСЛЕ (1 час)
+            buffer_start = exist_start - timedelta(hours=1)  # Зазор ДО начала брони
+            buffer_end = exist_end + timedelta(hours=1)      # Зазор ПОСЛЕ окончания брони
+            
+            # Проверяем пересечение: новая бронь не должна начинаться в зоне зазора или самой брони
+            if booking_start < buffer_end and booking_end > buffer_start:
                 reason = "В это время уже есть другое бронирование!"
                 await message.answer(f"❌ {reason} Пожалуйста, выберите другое время.")
                 conn.close()
@@ -250,18 +226,22 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         # Проверяем пересечения с бронированиями предыдущего дня
         for existing_time, existing_duration in prev_day_bookings:
             exist_start = datetime.strptime(existing_time, '%H:%M')
-            exist_end = exist_start + timedelta(hours=existing_duration)
+            exist_start_hour = exist_start.hour
             
-            # Если бронирование предыдущего дня заканчивается после полуночи
-            if exist_end.hour > 0 or (exist_end.hour == 0 and exist_end.minute > 0):
-                # Проверяем пересечение с временем на следующий день
-                next_day_start = datetime.strptime("00:00", '%H:%M')
-                next_day_end = exist_end
-                buffer_start = next_day_start - timedelta(hours=1)
+            # Проверяем, переходит ли бронирование через полночь
+            # Если start_hour + duration >= 24, то бронирование продолжается на следующий день
+            if exist_start_hour + existing_duration >= 24:
+                # Рассчитываем, до какого часа на следующий день продолжается бронирование
+                hours_into_next_day = (exist_start_hour + existing_duration) % 24
+                
+                # Время окончания бронирования на следующий день
+                next_day_end = datetime.strptime(f"{hours_into_next_day:02d}:00", '%H:%M')
+                
+                # Зазор ПОСЛЕ окончания бронирования (1 час)
                 buffer_end = next_day_end + timedelta(hours=1)
                 
-                # Пересечение?
-                if booking_start < buffer_end and booking_end > buffer_start:
+                # Проверяем пересечение: новая бронь не должна начинаться в зоне брони или зазора
+                if booking_start < buffer_end and booking_end > datetime.strptime("00:00", '%H:%M'):
                     reason = "В это время помещение занято бронированием с предыдущего дня!"
                     await message.answer(f"❌ {reason} Пожалуйста, выберите другое время.")
                     conn.close()
@@ -269,22 +249,39 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         
 
         
-        # Создаем бронирование
+        # ВСЕГДА формируем notes для бронирования с именем и телефоном, которые ввел пользователь
+        # booking_name и booking_phone - это данные, которые пользователь ВВЕЛ для ЭТОГО бронирования
+        # Каждое бронирование имеет свои уникальные данные в notes
+        notes_parts = []
+        # ВАЖНО: Используем booking_name и booking_phone (введенные пользователем), а не display_name/display_phone
+        # Это гарантирует, что каждое бронирование сохраняет свои уникальные данные
+        final_booking_name = booking_name if booking_name else display_name
+        final_booking_phone = booking_phone if booking_phone else display_phone
+        notes_parts.append(f"Имя для брони: {final_booking_name}")
+        notes_parts.append(f"Телефон для брони: {final_booking_phone}")
+        notes = " | ".join(notes_parts)
+        print(f"[DEBUG create_booking] Сохраняем notes: '{notes}' (booking_name={booking_name}, booking_phone={booking_phone})")
+        
+        # Создаем бронирование (ВСЕГДА сохраняем имя и телефон в notes для уникальности каждого бронирования)
         cur.execute(
-            "INSERT INTO bookings (user_id, date, time, guests, duration, total_price, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (user_id, date, time, guests, duration, total_price, datetime.now().isoformat())
+            "INSERT INTO bookings (user_id, date, time, guests, duration, total_price, status, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (user_id, date, time, guests, duration, total_price, notes, datetime.now().isoformat())
         )
         conn.commit()
         booking_id = cur.lastrowid
         conn.close()
         
         # Формируем информацию о стоимости
+        price_per_hour = await get_price_per_hour()
+        price_per_extra = await get_price_per_extra_guest()
+        max_included = await get_max_guests_included()
+        
         price_info = f"💰 Стоимость: {total_price}₽"
-        if guests > 8:
-            extra_guests = guests - 8
-            price_info += f"\n   (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+        if guests > max_included:
+            extra_guests = guests - max_included
+            price_info += f"\n   ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
         else:
-            price_info += f"\n   (800₽/час)"
+            price_info += f"\n   ({price_per_hour}₽/час)"
         
         # Уведомляем пользователя о создании бронирования (ожидает подтверждения)
         await message.answer(
@@ -300,21 +297,24 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         
         # Получаем username пользователя
         username = message.from_user.username
-        # Получаем имя и телефон из БД
+        # Для уведомления админу ВСЕГДА используем имя и телефон, которые ввел пользователь
+        # booking_name и booking_phone - это данные, которые пользователь ВВЕЛ для ЭТОГО бронирования
+        admin_display_name = booking_name if booking_name else display_name
+        admin_display_phone = booking_phone if booking_phone else display_phone
+        
+        # Получаем username из БД
         cur = get_db().cursor()
-        cur.execute("SELECT name, phone, username FROM users WHERE telegram_id = ?", (message.from_user.id,))
+        cur.execute("SELECT username FROM users WHERE telegram_id = ?", (telegram_id,))
         user_row = cur.fetchone()
-        if user_row:
-            booking_name, booking_phone, booking_username = user_row
-        else:
-            booking_name, booking_phone, booking_username = user_name, 'Не указан', None
+        booking_username = user_row[0] if user_row and user_row[0] else None
+        
         # Формируем тег
-        if booking_username:
+        if booking_username and booking_username != "None":
             tg_tag = f"@{booking_username}"
         elif username:
             tg_tag = f"@{username}"
         else:
-            tg_tag = f"tg://user?id={message.from_user.id}"
+            tg_tag = f"tg://user?id={telegram_id}"
         # Вычисляем время окончания
         start_time = datetime.strptime(time, '%H:%M')
         end_time_obj = start_time + timedelta(hours=duration)
@@ -325,26 +325,26 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
             end_time = end_time_obj.strftime('%H:%M')
         # Формируем информацию о стоимости для админа
         admin_price_info = f"💰 Стоимость: {total_price}₽"
-        if guests > 8:
-            extra_guests = guests - 8
-            admin_price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+        if guests > max_included:
+            extra_guests = guests - max_included
+            admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
         else:
-            admin_price_info += f" (800₽/час)"
+            admin_price_info += f" ({price_per_hour}₽/час)"
         
-        # Уведомляем админа
-        await notify_admin(
-            f"🆕 Новая заявка из бота!\n"
-            f"👤 Имя: {booking_name}\n"
-            f"📞 Телефон: {booking_phone}\n"
-            f"Тег: {tg_tag}\n"
-            f"🧩 TG ID: {message.from_user.id}\n"
-            f"📅 Дата: {date}\n"
-            f"🕐 Время: {time}\n"
-            f"⏰ Окончание: {end_time}\n"
-            f"👥 Гости: {guests}\n"
-            f"⏱ Длительность: {duration} ч.\n"
-            f"{admin_price_info}\n"
-            f"🆔 ID брони: {booking_id}")
+        # Уведомляем админа (используем имя и телефон, которые ввел пользователь для ЭТОГО бронирования)
+        notification_text = f"🆕 Новая заявка из бота!\n"
+        notification_text += f"👤 Имя: {admin_display_name}\n"
+        notification_text += f"📞 Телефон: {admin_display_phone}\n"
+        notification_text += f"Тег: {tg_tag}\n"
+        notification_text += f"🧩 TG ID: {telegram_id}\n"
+        notification_text += f"📅 Дата: {date}\n"
+        notification_text += f"🕐 Время: {time}\n"
+        notification_text += f"⏰ Окончание: {end_time}\n"
+        notification_text += f"👥 Гости: {guests}\n"
+        notification_text += f"⏱ Длительность: {duration} ч.\n"
+        notification_text += f"{admin_price_info}\n"
+        notification_text += f"🆔 ID брони: {booking_id}"
+        await notify_admin(notification_text)
         
     except Exception as e:
         await message.answer(f"❌ Ошибка при создании бронирования: {str(e)}")
@@ -476,7 +476,8 @@ def create_guests_keyboard():
 
 def create_duration_keyboard():
     """Создать клавиатуру с длительностью"""
-    durations = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]  # От 1 до 24 часов
+    max_duration = max(1, MAX_BOOKING_DURATION)
+    durations = list(range(1, max_duration + 1))
     keyboard = []
     for duration in durations:
         text = f"{duration} час{'а' if duration in [2,3,4] else 'ов' if duration > 4 else ''}"
@@ -497,18 +498,34 @@ def create_cancel_booking_keyboard(bookings):
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 async def notify_admin(text):
-    if not ADMIN_BOT_TOKEN or not ADMIN_USER_ID:
-        print("⚠️ Административные настройки не заданы. Отправка уведомления администратору отключена.")
+    """Отправить уведомление всем администраторам"""
+    if not ADMIN_BOT_TOKEN:
+        print("⚠️ ADMIN_BOT_TOKEN не задан. Отправка уведомления администраторам отключена.")
         return
+    
+    # Получаем список всех администраторов
+    admin_ids = await get_all_admin_ids()
+    
+    if not admin_ids:
+        # Если нет админов в БД, используем ADMIN_USER_ID из переменной окружения (для обратной совместимости)
+        if ADMIN_USER_ID:
+            admin_ids = [ADMIN_USER_ID]
+        else:
+            print("⚠️ Нет администраторов для отправки уведомлений.")
+            return
+    
     url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": ADMIN_USER_ID, "text": text}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=5) as resp:
-                if resp.status != 200:
-                    print(f"[admin notify error] Status: {resp.status}, Response: {await resp.text()}")
-    except Exception as e:
-        print(f"[admin notify error] {e}")
+    
+    # Отправляем уведомление всем администраторам
+    for admin_id in admin_ids:
+        payload = {"chat_id": admin_id, "text": text}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=5) as resp:
+                    if resp.status != 200:
+                        print(f"[admin notify error] Status: {resp.status} for admin {admin_id}, Response: {await resp.text()}")
+        except Exception as e:
+            print(f"[admin notify error] for admin {admin_id}: {e}")
 
 async def main():
     # Проверка переменных окружения
@@ -534,7 +551,8 @@ async def main():
     async def cmd_start(message: types.Message):
         await get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.full_name or "Пользователь")
         
-        welcome_text = f"""
+        # Получаем приветственный текст из настроек
+        welcome_text = await get_setting("welcome_text", f"""
 🏠 Добро пожаловать в антикафе «ЧиллиВили»!
 
 Привет, {message.from_user.first_name}! 👋
@@ -560,9 +578,33 @@ async def main():
 📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
 
 Выберите действие из меню ниже:
-        """
+        """)
         
-        await message.answer(welcome_text, reply_markup=create_main_menu())
+        # Заменяем плейсхолдер {first_name} на реальное имя
+        welcome_text = welcome_text.replace("{first_name}", message.from_user.first_name or "Пользователь")
+        
+        # Проверяем, есть ли медиа для приветствия
+        photo_id = await get_media_setting("welcome", "photo")
+        video_id = await get_media_setting("welcome", "video")
+        
+        # Обрезаем caption если слишком длинный (максимум 1024 символа для Telegram)
+        caption = welcome_text[:1024] if len(welcome_text) > 1024 else welcome_text
+        
+        # Приоритет: видео > фото
+        if video_id and video_id.strip():
+            try:
+                await message.answer_video(video=video_id, caption=caption, reply_markup=create_main_menu())
+            except Exception as e:
+                print(f"Ошибка при отправке видео: {e}")
+                await message.answer(welcome_text, reply_markup=create_main_menu())
+        elif photo_id and photo_id.strip():
+            try:
+                await message.answer_photo(photo=photo_id, caption=caption, reply_markup=create_main_menu())
+            except Exception as e:
+                print(f"Ошибка при отправке фото: {e}")
+                await message.answer(welcome_text, reply_markup=create_main_menu())
+        else:
+            await message.answer(welcome_text, reply_markup=create_main_menu())
 
     # @dp.message(F.text == "📱 Открыть приложение")
     # async def handle_webapp_button(message: types.Message):
@@ -586,7 +628,13 @@ async def main():
 
     @dp.message(F.text == "🏠 Забронировать ЧиллиВили!")
     async def handle_book_button(message: types.Message):
-        user_id = await get_or_create_user(message.from_user.id)
+        user_id = await get_or_create_user(
+            message.from_user.id, 
+            message.from_user.username, 
+            message.from_user.full_name or "Пользователь"
+        )
+        # ВСЕГДА создаем новый чистый state для каждого нового бронирования
+        # Это гарантирует, что имя и телефон будут запрошены заново
         user_states[message.from_user.id] = {"state": "selecting_date"}
         
         keyboard = await create_date_keyboard()
@@ -594,7 +642,11 @@ async def main():
 
     @dp.message(F.text == "📝 Мои бронирования")
     async def handle_my_bookings_button(message: types.Message):
-        user_id = await get_or_create_user(message.from_user.id)
+        user_id = await get_or_create_user(
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.full_name or "Пользователь"
+        )
         bookings = await get_user_bookings(user_id)
         
         if not bookings:
@@ -626,7 +678,11 @@ async def main():
 
     @dp.message(F.text == "❌ Отменить бронирование")
     async def handle_cancel_booking_button(message: types.Message):
-        user_id = await get_or_create_user(message.from_user.id)
+        user_id = await get_or_create_user(
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.full_name or "Пользователь"
+        )
         bookings = await get_user_bookings(user_id)
         active_bookings = [b for b in bookings if b[7] != 'cancelled']
         if not active_bookings:
@@ -637,7 +693,8 @@ async def main():
 
     @dp.message(F.text == "ℹ️ Информация")
     async def handle_info_button(message: types.Message):
-        info_text = """
+        # Получаем текст информации из настроек
+        info_text = await get_setting("info_text", """
 🏠 Антикафе «ЧиллиВили»
 
 📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
@@ -672,12 +729,41 @@ async def main():
 
 Загляни в ЧиллиВили — тут время действительно твоё.
 Только бронируй заранее, особенно в выходные 😉
-        """
+        """)
+        
+        # Проверяем, есть ли медиа для этого раздела
+        photo_id = await get_media_setting("info", "photo")
+        video_id = await get_media_setting("info", "video")
+        
+        # Отладочная информация
+        print(f"DEBUG info: photo_id={photo_id[:50] if photo_id else 'None'}..., video_id={video_id[:50] if video_id else 'None'}...")
+        
+        # Обрезаем caption если слишком длинный (максимум 1024 символа для Telegram)
+        caption = info_text[:1024] if len(info_text) > 1024 else info_text
+        
+        # Приоритет: видео > фото
+        if video_id and video_id.strip():
+            try:
+                print(f"Отправка видео для info: file_id={video_id[:50]}...")
+                await message.answer_video(video=video_id, caption=caption)
+            except Exception as e:
+                print(f"Ошибка при отправке видео: {e}")
+                await message.answer(info_text)
+        elif photo_id and photo_id.strip():
+            try:
+                print(f"Отправка фото для info: file_id={photo_id[:50]}...")
+                await message.answer_photo(photo=photo_id, caption=caption)
+            except Exception as e:
+                print(f"Ошибка при отправке фото: {e}, file_id={photo_id[:50] if photo_id else 'None'}")
+                await message.answer(info_text)
+        else:
+            print(f"DEBUG: Медиа не найдено для info (photo_id={photo_id}, video_id={video_id})")
         await message.answer(info_text)
 
     @dp.message(F.text == "❓ Помощь")
     async def handle_help_button(message: types.Message):
-        help_text = """
+        # Получаем текст помощи из настроек
+        help_text = await get_setting("help_text", """
 🏠 Антикафе «ЧиллиВили» - справка
 
 💡 Как забронировать:
@@ -707,20 +793,46 @@ async def main():
 • Оплата почасовая 
 
 📍 По всем вопросам поддержка 24/7: @ChilliWiliKirov
-        """
-        await message.answer(help_text)
+        """)
+        
+        # Проверяем, есть ли медиа для этого раздела
+        photo_id = await get_media_setting("help", "photo")
+        video_id = await get_media_setting("help", "video")
+        
+        # Обрезаем caption если слишком длинный (максимум 1024 символа для Telegram)
+        caption = help_text[:1024] if len(help_text) > 1024 else help_text
+        
+        # Приоритет: видео > фото
+        if video_id and video_id.strip():
+            try:
+                await message.answer_video(video=video_id, caption=caption)
+            except Exception as e:
+                print(f"Ошибка при отправке видео: {e}")
+                await message.answer(help_text)
+        elif photo_id and photo_id.strip():
+            try:
+                await message.answer_photo(photo=photo_id, caption=caption)
+            except Exception as e:
+                print(f"Ошибка при отправке фото: {e}")
+                await message.answer(help_text)
+        else:
+            await message.answer(help_text)
 
     @dp.callback_query(F.data.regexp(r"^date_"))
     async def handle_date_selection(callback: types.CallbackQuery):
         selected_date = callback.data.split("_")[1]
-        user_id = await get_or_create_user(callback.from_user.id)
+        user_id = await get_or_create_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name or "Пользователь"
+        )
         
         user_states[callback.from_user.id] = {
             "state": "selecting_time",
             "date": selected_date
         }
         
-        available_times = await get_available_times(selected_date)
+        available_times = await db_get_available_times(selected_date)
         if not available_times:
             await callback.message.edit_text("❌ На выбранную дату нет свободных мест")
             return
@@ -733,7 +845,11 @@ async def main():
     @dp.callback_query(F.data.regexp(r"^time_"))
     async def handle_time_selection(callback: types.CallbackQuery):
         selected_time = callback.data.split("_")[1]
-        user_id = await get_or_create_user(callback.from_user.id)
+        user_id = await get_or_create_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name or "Пользователь"
+        )
         state = user_states.get(callback.from_user.id)
         
         if not state or state["state"] != "selecting_time":
@@ -753,7 +869,11 @@ async def main():
     async def handle_guests_selection(callback: types.CallbackQuery):
         if callback.data == "guests_more":
             # Обработка кнопки "И более"
-            user_id = await get_or_create_user(callback.from_user.id)
+            user_id = await get_or_create_user(
+                callback.from_user.id,
+                callback.from_user.username,
+                callback.from_user.full_name or "Пользователь"
+            )
             state = user_states.get(callback.from_user.id)
             
             if not state or state["state"] != "selecting_guests":
@@ -770,7 +890,11 @@ async def main():
             return
         
         guests = int(callback.data.split("_")[1])
-        user_id = await get_or_create_user(callback.from_user.id)
+        user_id = await get_or_create_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name or "Пользователь"
+        )
         state = user_states.get(callback.from_user.id)
         
         if not state or state["state"] != "selecting_guests":
@@ -790,18 +914,37 @@ async def main():
     @dp.callback_query(F.data.regexp(r"^duration_"))
     async def handle_duration_selection(callback: types.CallbackQuery):
         duration = int(callback.data.split("_")[1])
-        user_id = await get_or_create_user(callback.from_user.id)
+        user_id = await get_or_create_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name or "Пользователь"
+        )
         state = user_states.get(callback.from_user.id)
         if not state or state["state"] != "selecting_duration":
             await callback.answer("❌ Ошибка")
             return
+
+        start_time = datetime.strptime(state["time"], "%H:%M")
+        max_duration = CLOSE_HOUR - start_time.hour
+        if max_duration <= 0:
+            await callback.answer("❌ На это время нельзя забронировать.", show_alert=True)
+            return
+        if duration > max_duration:
+            await callback.answer(
+                f"❌ Максимальная длительность для {state['time']} — {max_duration} ч.",
+                show_alert=True
+            )
+            return
         # Сохраняем выбранную длительность
+        # ВАЖНО: При переходе к вводу имени создаем новый state БЕЗ старых name и phone
+        # Это гарантирует, что для каждого нового бронирования имя и телефон будут запрошены заново
         user_states[callback.from_user.id] = {
             "state": "waiting_for_name",
             "date": state["date"],
             "time": state["time"],
             "guests": state["guests"],
             "duration": duration
+            # НЕ включаем старые "name" и "phone" - они будут введены заново
         }
         await callback.message.edit_text("✏️ Введите ваше имя для бронирования:")
 
@@ -827,9 +970,17 @@ async def main():
         if not name:
             await message.answer("❌ Пожалуйста, введите имя!")
             return
+        
+        # ВАЖНО: ВСЕГДА сохраняем имя, которое пользователь ВВЕЛ для ЭТОГО бронирования
+        # Это гарантирует, что каждое бронирование будет иметь свои уникальные данные
         state = user_states.get(message.from_user.id)
-        user_states[message.from_user.id]["name"] = name
-        user_states[message.from_user.id]["state"] = "waiting_for_phone"
+        if not state:
+            await message.answer("❌ Ошибка: сессия бронирования не найдена. Пожалуйста, начните бронирование заново.")
+            return
+        
+        # Сохраняем имя для ЭТОГО бронирования (перезаписываем старое значение, если оно есть)
+        state["name"] = name
+        state["state"] = "waiting_for_phone"
         await message.answer("📱 Введите ваш номер телефона:")
 
     @dp.message(lambda message: user_states.get(message.from_user.id, {}).get("state") == "waiting_for_phone")
@@ -839,16 +990,55 @@ async def main():
         if not phone or len(phone) < 6:
             await message.answer("❌ Пожалуйста, введите корректный номер телефона!")
             return
-        state = user_states.get(message.from_user.id)
-        # Сохраняем имя и телефон в БД пользователя
-        user_id = await get_or_create_user(message.from_user.id, name=state["name"])
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET name = ?, phone = ? WHERE telegram_id = ?", (state["name"], phone, message.from_user.id))
-            await db.commit()
-        # Создаём бронирование
-        await create_booking(message, state["date"], state["time"], state["guests"], state["duration"])
         
-        # Очищаем состояние пользователя
+        state = user_states.get(message.from_user.id)
+        if not state:
+            await message.answer("❌ Ошибка: сессия бронирования не найдена. Пожалуйста, начните бронирование заново.")
+            return
+        
+        # ВАЖНО: ВСЕГДА сохраняем телефон, который пользователь ВВЕЛ для ЭТОГО бронирования
+        # Это гарантирует, что каждое бронирование будет иметь свои уникальные данные
+        state["phone"] = phone
+        # Получаем или создаем пользователя (без обновления имени и телефона)
+        user_id = await get_or_create_user(
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.full_name or "Пользователь"
+        )
+        # Сохраняем имя и телефон только для этого бронирования
+        # (они будут использованы в create_booking, но не изменят данные пользователя)
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Обновляем имя и телефон только если они пустые (None или "Пользователь")
+            async with db.execute("SELECT name, phone FROM users WHERE telegram_id = ?", (message.from_user.id,)) as cursor:
+                user_data = await cursor.fetchone()
+                if user_data:
+                    current_name, current_phone = user_data
+                    # Обновляем только если текущие данные пустые или дефолтные
+                    if (not current_name or current_name == "None" or current_name == "Пользователь"):
+                        await db.execute("UPDATE users SET name = ? WHERE telegram_id = ?", (state["name"], message.from_user.id))
+                    if (not current_phone or current_phone == "None" or current_phone == "Не указан"):
+                        await db.execute("UPDATE users SET phone = ? WHERE telegram_id = ?", (phone, message.from_user.id))
+            await db.commit()
+        # ВАЖНО: ВСЕГДА используем имя и телефон, которые только что ввел пользователь
+        # Эти данные будут сохранены в notes для этого конкретного бронирования
+        booking_name = state.get("name")  # Имя, которое ввел пользователь
+        booking_phone = phone  # Телефон, который ввел пользователь
+        
+        # Проверяем, что данные есть
+        if not booking_name:
+            await message.answer("❌ Ошибка: имя не найдено. Пожалуйста, начните бронирование заново.")
+            del user_states[message.from_user.id]
+            return
+        
+        if not booking_phone:
+            await message.answer("❌ Ошибка: телефон не найден. Пожалуйста, начните бронирование заново.")
+            del user_states[message.from_user.id]
+            return
+        
+        # Создаём бронирование с именем и телефоном, которые ввел пользователь
+        await create_booking(message, state["date"], state["time"], state["guests"], state["duration"], booking_name, booking_phone)
+        
+        # Очищаем состояние пользователя после создания бронирования
         del user_states[message.from_user.id]
 
     @dp.callback_query(F.data == "cancel")
@@ -860,7 +1050,11 @@ async def main():
     @dp.callback_query(F.data.regexp(r"^cancel_booking_"))
     async def handle_cancel_booking_callback(callback: types.CallbackQuery):
         booking_id = int(callback.data.split("_")[-1])
-        user_id = await get_or_create_user(callback.from_user.id)
+        user_id = await get_or_create_user(
+            callback.from_user.id,
+            callback.from_user.username,
+            callback.from_user.full_name or "Пользователь"
+        )
         
         # Получаем информацию о бронировании перед отменой
         async with aiosqlite.connect(DB_PATH) as db:
