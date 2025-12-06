@@ -84,6 +84,23 @@ async def init_db():
             )
         ''')
         
+        # Таблица правил ценообразования
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS price_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                price_per_hour INTEGER NOT NULL,
+                price_per_extra_guest INTEGER NOT NULL,
+                extra_guest_payment_type TEXT NOT NULL DEFAULT 'per_booking',
+                max_guests_included INTEGER NOT NULL DEFAULT 8,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        
         await db.commit()
         
         # Миграции: добавляем недостающие колонки
@@ -312,7 +329,7 @@ async def create_booking_by_admin(
     async with aiosqlite.connect(DB_PATH) as db:
         # Расчет цены если не указана
         if total_price is None:
-            total_price = await calculate_booking_price(guests, duration)
+            total_price = await calculate_booking_price(guests, duration, date, time)
         
         # Получаем или создаем пользователя
         if telegram_id:
@@ -656,17 +673,37 @@ async def set_max_guests_included(count: int) -> bool:
     """Установить максимальное количество гостей, включенных в базовую цену"""
     return await set_setting("max_guests_included", str(count), "number")
 
-async def calculate_booking_price(guests: int, duration: int) -> int:
-    """Рассчитать стоимость бронирования"""
-    price_per_hour = await get_price_per_hour()
-    price_per_extra = await get_price_per_extra_guest()
-    max_included = await get_max_guests_included()
+async def calculate_booking_price(guests: int, duration: int, booking_date: str = None, booking_time: str = None) -> int:
+    """Рассчитать стоимость бронирования с учетом правил ценообразования"""
+    # Сначала проверяем, есть ли специальное правило для этой даты и времени
+    if booking_date and booking_time:
+        rule = await get_price_rule_for_booking(booking_date, booking_time)
+        if rule:
+            price_per_hour = rule['price_per_hour']
+            price_per_extra = rule['price_per_extra_guest']
+            max_included = rule['max_guests_included']
+            payment_type = rule['extra_guest_payment_type']
+        else:
+            # Используем стандартные настройки
+            price_per_hour = await get_price_per_hour()
+            price_per_extra = await get_price_per_extra_guest()
+            max_included = await get_max_guests_included()
+            payment_type = 'per_booking'  # По умолчанию
+    else:
+        # Используем стандартные настройки
+        price_per_hour = await get_price_per_hour()
+        price_per_extra = await get_price_per_extra_guest()
+        max_included = await get_max_guests_included()
+        payment_type = 'per_booking'  # По умолчанию
     
     base_price = duration * price_per_hour
     
     if guests > max_included:
         extra_guests = guests - max_included
-        extra_price = extra_guests * price_per_extra
+        if payment_type == 'per_hour':
+            extra_price = extra_guests * price_per_extra * duration
+        else:  # per_booking
+            extra_price = extra_guests * price_per_extra
         return base_price + extra_price
     
     return base_price
@@ -790,6 +827,137 @@ async def delete_expense(expense_id: int) -> bool:
     """Удалить расход"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("DELETE FROM expenses WHERE id = ?", (expense_id,)) as cursor:
+            await db.commit()
+            return cursor.rowcount > 0
+
+# Функции для работы с правилами ценообразования
+async def get_price_rule_for_booking(booking_date: str, booking_time: str) -> Optional[Dict]:
+    """Получить правило ценообразования для конкретной даты и времени"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT * FROM price_rules 
+            WHERE start_date <= ? AND end_date >= ?
+            AND start_time <= ? AND end_time > ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (booking_date, booking_date, booking_time, booking_time)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            
+            columns = [column[0] for column in cursor.description]
+            return dict(zip(columns, row))
+
+async def add_price_rule(
+    start_date: str,
+    end_date: str,
+    start_time: str,
+    end_time: str,
+    price_per_hour: int,
+    price_per_extra_guest: int,
+    extra_guest_payment_type: str = 'per_booking',
+    max_guests_included: int = 8
+) -> int:
+    """Добавить правило ценообразования"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO price_rules (
+                start_date, end_date, start_time, end_time,
+                price_per_hour, price_per_extra_guest,
+                extra_guest_payment_type, max_guests_included,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            start_date, end_date, start_time, end_time,
+            price_per_hour, price_per_extra_guest,
+            extra_guest_payment_type, max_guests_included,
+            datetime.now().isoformat(), datetime.now().isoformat()
+        ))
+        await db.commit()
+        
+        async with db.execute("SELECT last_insert_rowid()") as cursor:
+            return (await cursor.fetchone())[0]
+
+async def get_all_price_rules() -> List[Dict]:
+    """Получить все правила ценообразования"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT * FROM price_rules 
+            ORDER BY start_date DESC, start_time DESC
+        """) as cursor:
+            rows = await cursor.fetchall()
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+async def get_price_rule_by_id(rule_id: int) -> Optional[Dict]:
+    """Получить правило по ID"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT * FROM price_rules WHERE id = ?", (rule_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            
+            columns = [column[0] for column in cursor.description]
+            return dict(zip(columns, row))
+
+async def update_price_rule(
+    rule_id: int,
+    start_date: str = None,
+    end_date: str = None,
+    start_time: str = None,
+    end_time: str = None,
+    price_per_hour: int = None,
+    price_per_extra_guest: int = None,
+    extra_guest_payment_type: str = None,
+    max_guests_included: int = None
+) -> bool:
+    """Обновить правило ценообразования"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        updates = []
+        params = []
+        
+        if start_date is not None:
+            updates.append("start_date = ?")
+            params.append(start_date)
+        if end_date is not None:
+            updates.append("end_date = ?")
+            params.append(end_date)
+        if start_time is not None:
+            updates.append("start_time = ?")
+            params.append(start_time)
+        if end_time is not None:
+            updates.append("end_time = ?")
+            params.append(end_time)
+        if price_per_hour is not None:
+            updates.append("price_per_hour = ?")
+            params.append(price_per_hour)
+        if price_per_extra_guest is not None:
+            updates.append("price_per_extra_guest = ?")
+            params.append(price_per_extra_guest)
+        if extra_guest_payment_type is not None:
+            updates.append("extra_guest_payment_type = ?")
+            params.append(extra_guest_payment_type)
+        if max_guests_included is not None:
+            updates.append("max_guests_included = ?")
+            params.append(max_guests_included)
+        
+        if not updates:
+            return False
+        
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(rule_id)
+        
+        query = f"UPDATE price_rules SET {', '.join(updates)} WHERE id = ?"
+        
+        async with db.execute(query, params) as cursor:
+            await db.commit()
+            return cursor.rowcount > 0
+
+async def delete_price_rule(rule_id: int) -> bool:
+    """Удалить правило ценообразования"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("DELETE FROM price_rules WHERE id = ?", (rule_id,)) as cursor:
             await db.commit()
             return cursor.rowcount > 0
 

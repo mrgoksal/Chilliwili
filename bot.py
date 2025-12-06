@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta
 import json
 import aiohttp
 from calendar import monthrange
-from db import DB_PATH, get_available_times as db_get_available_times, get_setting, get_media_setting, calculate_booking_price, get_price_per_hour, get_price_per_extra_guest, get_max_guests_included, get_all_admin_ids, OPEN_HOUR, CLOSE_HOUR, MAX_BOOKING_DURATION
+from db import DB_PATH, get_available_times as db_get_available_times, get_setting, get_media_setting, calculate_booking_price, get_price_per_hour, get_price_per_extra_guest, get_max_guests_included, get_all_admin_ids, OPEN_HOUR, CLOSE_HOUR, MAX_BOOKING_DURATION, get_price_rule_for_booking
 
 # Загрузка .env (если установлен python-dotenv)
 try:
@@ -171,7 +171,7 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         display_phone = booking_phone if booking_phone else "Не указан"
         
         # Расчет стоимости с использованием настроек цен
-        total_price = await calculate_booking_price(guests, duration)
+        total_price = await calculate_booking_price(guests, duration, date, time)
         
         # Проверяем доступность времени
         cur.execute("""
@@ -272,14 +272,26 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
         conn.close()
         
         # Формируем информацию о стоимости
-        price_per_hour = await get_price_per_hour()
-        price_per_extra = await get_price_per_extra_guest()
-        max_included = await get_max_guests_included()
+        # Получаем актуальные цены из правила или стандартных настроек
+        rule = await get_price_rule_for_booking(date, time)
+        if rule:
+            price_per_hour = rule['price_per_hour']
+            price_per_extra = rule['price_per_extra_guest']
+            max_included = rule['max_guests_included']
+            payment_type = rule['extra_guest_payment_type']
+        else:
+            price_per_hour = await get_price_per_hour()
+            price_per_extra = await get_price_per_extra_guest()
+            max_included = await get_max_guests_included()
+            payment_type = 'per_booking'
         
         price_info = f"💰 Стоимость: {total_price}₽"
         if guests > max_included:
             extra_guests = guests - max_included
-            price_info += f"\n   ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
+            if payment_type == 'per_hour':
+                price_info += f"\n   ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽/час за {extra_guests} гостей сверх {max_included})"
+            else:
+                price_info += f"\n   ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
         else:
             price_info += f"\n   ({price_per_hour}₽/час)"
         
@@ -323,11 +335,14 @@ async def create_booking(message: types.Message, date: str, time: str, guests: i
             end_time = f"{end_time_obj.strftime('%H:%M')} (+1 день)"
         else:
             end_time = end_time_obj.strftime('%H:%M')
-        # Формируем информацию о стоимости для админа
+        # Формируем информацию о стоимости для админа (используем те же значения, что и для пользователя)
         admin_price_info = f"💰 Стоимость: {total_price}₽"
         if guests > max_included:
             extra_guests = guests - max_included
-            admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
+            if payment_type == 'per_hour':
+                admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽/час за {extra_guests} гостей сверх {max_included})"
+            else:
+                admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
         else:
             admin_price_info += f" ({price_per_hour}₽/час)"
         
@@ -659,14 +674,32 @@ async def main():
             display_date = date_obj.strftime("%d.%m.%Y")
             guests = booking[4]
             total_price = booking[6]
+            booking_date = booking[2]
+            booking_time = booking[3]
+            
+            # Получаем актуальные цены из правила или стандартных настроек
+            rule = await get_price_rule_for_booking(booking_date, booking_time)
+            if rule:
+                price_per_hour = rule['price_per_hour']
+                price_per_extra = rule['price_per_extra_guest']
+                max_included = rule['max_guests_included']
+                payment_type = rule['extra_guest_payment_type']
+            else:
+                price_per_hour = await get_price_per_hour()
+                price_per_extra = await get_price_per_extra_guest()
+                max_included = await get_max_guests_included()
+                payment_type = 'per_booking'
             
             # Формируем информацию о стоимости
             price_info = f"💰 {total_price} ₽"
-            if guests > 8:
-                extra_guests = guests - 8
-                price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+            if guests > max_included:
+                extra_guests = guests - max_included
+                if payment_type == 'per_hour':
+                    price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽/час за {extra_guests} гостей сверх {max_included})"
+                else:
+                    price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
             else:
-                price_info += f" (800₽/час)"
+                price_info += f" ({price_per_hour}₽/час)"
             
             text += f"📅 {display_date} в {booking[3]}\n"
             text += f"👥 {guests} гостей\n"
@@ -1098,13 +1131,28 @@ async def main():
                         else:
                             tg_tag = f"tg://user?id={user_telegram_id}"
                         
-                        # Формируем информацию о стоимости
-                        admin_price_info = f"💰 Стоимость: {total_price}₽"
-                        if guests > 8:
-                            extra_guests = guests - 8
-                            admin_price_info += f" (800₽/час + {extra_guests}×500₽ за {extra_guests} гостей сверх 8)"
+                        # Формируем информацию о стоимости (получаем актуальные цены из правила)
+                        rule = await get_price_rule_for_booking(booking_date, booking_time)
+                        if rule:
+                            price_per_hour = rule['price_per_hour']
+                            price_per_extra = rule['price_per_extra_guest']
+                            max_included = rule['max_guests_included']
+                            payment_type = rule['extra_guest_payment_type']
                         else:
-                            admin_price_info += f" (800₽/час)"
+                            price_per_hour = await get_price_per_hour()
+                            price_per_extra = await get_price_per_extra_guest()
+                            max_included = await get_max_guests_included()
+                            payment_type = 'per_booking'
+                        
+                        admin_price_info = f"💰 Стоимость: {total_price}₽"
+                        if guests > max_included:
+                            extra_guests = guests - max_included
+                            if payment_type == 'per_hour':
+                                admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽/час за {extra_guests} гостей сверх {max_included})"
+                            else:
+                                admin_price_info += f" ({price_per_hour}₽/час + {extra_guests}×{price_per_extra}₽ за {extra_guests} гостей сверх {max_included})"
+                        else:
+                            admin_price_info += f" ({price_per_hour}₽/час)"
                         
                         # Вычисляем время окончания
                         start_time = datetime.strptime(booking_time, '%H:%M')

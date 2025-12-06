@@ -24,7 +24,8 @@ from db import (
     get_price_per_hour, set_price_per_hour, get_price_per_extra_guest, set_price_per_extra_guest,
     get_max_guests_included, set_max_guests_included,
     add_expense, get_expenses, get_expenses_by_month, delete_expense, update_expense, get_expense_by_id,
-    get_revenue_by_month, get_bookings_for_export, OPEN_HOUR, CLOSE_HOUR, MAX_BOOKING_DURATION
+    get_revenue_by_month, get_bookings_for_export, OPEN_HOUR, CLOSE_HOUR, MAX_BOOKING_DURATION,
+    add_price_rule, get_all_price_rules, get_price_rule_by_id, update_price_rule, delete_price_rule
 )
 
 # Загрузка .env (если установлен python-dotenv)
@@ -1224,6 +1225,7 @@ async def main():
 Выберите, что хотите изменить:"""
         
         keyboard = [
+            [InlineKeyboardButton(text="📅 Правила ценообразования", callback_data="price_rules_menu")],
             [InlineKeyboardButton(text="🕐 Изменить цену за час", callback_data="edit_price_per_hour")],
             [InlineKeyboardButton(text="👥 Изменить цену за доп. гостя", callback_data="edit_price_per_extra")],
             [InlineKeyboardButton(text="🔢 Изменить макс. гостей в базе", callback_data="edit_max_guests")],
@@ -1318,6 +1320,587 @@ async def main():
             await message.answer(f"❌ Ошибка: {str(e)}")
         
         del admin_states[message.from_user.id]
+    
+    @dp.callback_query(F.data == "price_rules_menu")
+    async def handle_price_rules_menu(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        if not await is_super_admin(callback.from_user.id):
+            await callback.answer("❌ Только супер-администратор может управлять правилами ценообразования")
+            return
+        
+        rules = await get_all_price_rules()
+        
+        text = "📅 **Правила ценообразования**\n\n"
+        if rules:
+            text += f"Всего правил: {len(rules)}\n\n"
+            for rule in rules[:5]:  # Показываем первые 5
+                start_date = datetime.strptime(rule['start_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+                end_date = datetime.strptime(rule['end_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+                payment_type = "за час" if rule['extra_guest_payment_type'] == 'per_hour' else "за все время"
+                text += f"• {start_date} - {end_date} ({rule['start_time']}-{rule['end_time']})\n"
+                text += f"  {rule['price_per_hour']} ₽/ч, доп. гость: {rule['price_per_extra_guest']} ₽ ({payment_type})\n\n"
+            if len(rules) > 5:
+                text += f"... и еще {len(rules) - 5} правил\n\n"
+        else:
+            text += "Правил пока нет. Создайте первое правило!\n\n"
+        
+        text += "Выберите действие:"
+        
+        keyboard = [
+            [InlineKeyboardButton(text="➕ Добавить правило", callback_data="add_price_rule")],
+            [InlineKeyboardButton(text="📋 Список правил", callback_data="list_price_rules")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="price_management_back")]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+    
+    @dp.callback_query(F.data == "price_management_back")
+    async def handle_price_management_back(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        price_per_hour = await get_price_per_hour()
+        price_per_extra = await get_price_per_extra_guest()
+        max_guests = await get_max_guests_included()
+        
+        text = f"""💰 **Управление ценами**
+
+📊 **Текущие цены:**
+• Цена за час (до {max_guests} человек): {price_per_hour} ₽
+• Цена за дополнительного гостя (сверх {max_guests}): {price_per_extra} ₽
+• Максимум гостей в базовой цене: {max_guests}
+
+Выберите, что хотите изменить:"""
+        
+        keyboard = [
+            [InlineKeyboardButton(text="📅 Правила ценообразования", callback_data="price_rules_menu")],
+            [InlineKeyboardButton(text="🕐 Изменить цену за час", callback_data="edit_price_per_hour")],
+            [InlineKeyboardButton(text="👥 Изменить цену за доп. гостя", callback_data="edit_price_per_extra")],
+            [InlineKeyboardButton(text="🔢 Изменить макс. гостей в базе", callback_data="edit_max_guests")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+    
+    @dp.callback_query(F.data == "add_price_rule")
+    async def handle_add_price_rule_button(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        admin_states[callback.from_user.id] = {"state": "adding_price_rule_start_date"}
+        await callback.message.edit_text(
+            "📅 **Добавление правила ценообразования**\n\n"
+            "Введите дату начала действия правила в формате ДД.ММ.ГГГГ (например, 01.12.2024):"
+        )
+        await callback.answer()
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_start_date")
+    async def handle_add_price_rule_start_date(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+            formatted_date = date_obj.strftime("%Y-%m-%d")
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_end_date",
+                "start_date": formatted_date
+            }
+            await message.answer("📅 Введите дату окончания действия правила в формате ДД.ММ.ГГГГ:")
+        except ValueError:
+            await message.answer("❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ")
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_end_date")
+    async def handle_add_price_rule_end_date(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+            formatted_date = date_obj.strftime("%Y-%m-%d")
+            state = admin_states[message.from_user.id]
+            
+            if formatted_date < state["start_date"]:
+                await message.answer("❌ Дата окончания не может быть раньше даты начала!")
+                return
+            
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_start_time",
+                "start_date": state["start_date"],
+                "end_date": formatted_date
+            }
+            await message.answer(
+                f"🕐 Введите время начала действия правила в формате ЧЧ:ММ (например, 10:00):\n"
+                f"Рабочее время: {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00"
+            )
+        except ValueError:
+            await message.answer("❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ")
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_start_time")
+    async def handle_add_price_rule_start_time(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            time_obj = datetime.strptime(message.text.strip(), "%H:%M")
+            if time_obj.hour < OPEN_HOUR or time_obj.hour >= CLOSE_HOUR:
+                await message.answer(f"❌ Время должно быть в диапазоне {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00")
+                return
+            formatted_time = time_obj.strftime("%H:%M")
+            state = admin_states[message.from_user.id]
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_end_time",
+                "start_date": state["start_date"],
+                "end_date": state["end_date"],
+                "start_time": formatted_time
+            }
+            await message.answer(
+                f"🕐 Введите время окончания действия правила в формате ЧЧ:ММ (например, 22:00):\n"
+                f"Должно быть позже {formatted_time}"
+            )
+        except ValueError:
+            await message.answer("❌ Неверный формат времени. Используйте формат ЧЧ:ММ")
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_end_time")
+    async def handle_add_price_rule_end_time(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            time_obj = datetime.strptime(message.text.strip(), "%H:%M")
+            if time_obj.hour < OPEN_HOUR or time_obj.hour > CLOSE_HOUR:
+                await message.answer(f"❌ Время должно быть в диапазоне {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00")
+                return
+            formatted_time = time_obj.strftime("%H:%M")
+            state = admin_states[message.from_user.id]
+            
+            if formatted_time <= state["start_time"]:
+                await message.answer(f"❌ Время окончания должно быть позже времени начала ({state['start_time']})!")
+                return
+            
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_price_per_hour",
+                "start_date": state["start_date"],
+                "end_date": state["end_date"],
+                "start_time": state["start_time"],
+                "end_time": formatted_time
+            }
+            await message.answer("💰 Введите цену за час (в рублях, число):")
+        except ValueError:
+            await message.answer("❌ Неверный формат времени. Используйте формат ЧЧ:ММ")
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_price_per_hour")
+    async def handle_add_price_rule_price_per_hour(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            price = int(message.text.strip())
+            if price < 0:
+                await message.answer("❌ Цена не может быть отрицательной!")
+                return
+            state = admin_states[message.from_user.id]
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_price_per_extra",
+                "start_date": state["start_date"],
+                "end_date": state["end_date"],
+                "start_time": state["start_time"],
+                "end_time": state["end_time"],
+                "price_per_hour": price
+            }
+            await message.answer("💰 Введите цену за дополнительного гостя (в рублях, число):")
+        except ValueError:
+            await message.answer("❌ Введите корректное число!")
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_price_per_extra")
+    async def handle_add_price_rule_price_per_extra(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            price = int(message.text.strip())
+            if price < 0:
+                await message.answer("❌ Цена не может быть отрицательной!")
+                return
+            state = admin_states[message.from_user.id]
+            admin_states[message.from_user.id] = {
+                "state": "adding_price_rule_payment_type",
+                "start_date": state["start_date"],
+                "end_date": state["end_date"],
+                "start_time": state["start_time"],
+                "end_time": state["end_time"],
+                "price_per_hour": state["price_per_hour"],
+                "price_per_extra_guest": price
+            }
+            text = (
+                "💳 Выберите тип доплаты за дополнительного гостя:\n\n"
+                "• За все время пребывания - фиксированная сумма\n"
+                "• За каждый час - сумма умножается на длительность"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text="⏱ За все время", callback_data="payment_type_per_booking")],
+                [InlineKeyboardButton(text="🕐 За каждый час", callback_data="payment_type_per_hour")]
+            ]
+            markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await message.answer(text, reply_markup=markup)
+        except ValueError:
+            await message.answer("❌ Введите корректное число!")
+    
+    @dp.callback_query(F.data.in_(["payment_type_per_booking", "payment_type_per_hour"]))
+    async def handle_price_rule_payment_type(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        payment_type = "per_booking" if callback.data == "payment_type_per_booking" else "per_hour"
+        state = admin_states[callback.from_user.id]
+        admin_states[callback.from_user.id] = {
+            "state": "adding_price_rule_max_guests",
+            "start_date": state["start_date"],
+            "end_date": state["end_date"],
+            "start_time": state["start_time"],
+            "end_time": state["end_time"],
+            "price_per_hour": state["price_per_hour"],
+            "price_per_extra_guest": state["price_per_extra_guest"],
+            "payment_type": payment_type
+        }
+        await callback.message.edit_text("🔢 Введите количество гостей, включенных в базовую цену (число):")
+        await callback.answer()
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state") == "adding_price_rule_max_guests")
+    async def handle_add_price_rule_max_guests(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        try:
+            max_guests = int(message.text.strip())
+            if max_guests < 1:
+                await message.answer("❌ Количество должно быть больше 0!")
+                return
+            state = admin_states[message.from_user.id]
+            
+            rule_id = await add_price_rule(
+                start_date=state["start_date"],
+                end_date=state["end_date"],
+                start_time=state["start_time"],
+                end_time=state["end_time"],
+                price_per_hour=state["price_per_hour"],
+                price_per_extra_guest=state["price_per_extra_guest"],
+                extra_guest_payment_type=state["payment_type"],
+                max_guests_included=max_guests
+            )
+            
+            start_date_display = datetime.strptime(state["start_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+            end_date_display = datetime.strptime(state["end_date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+            payment_type_text = "за все время" if state["payment_type"] == "per_booking" else "за каждый час"
+            
+            await message.answer(
+                f"✅ Правило ценообразования успешно создано!\n\n"
+                f"📅 Период: {start_date_display} - {end_date_display}\n"
+                f"🕐 Время: {state['start_time']} - {state['end_time']}\n"
+                f"💰 Цена за час: {state['price_per_hour']} ₽\n"
+                f"👥 Цена за доп. гостя: {state['price_per_extra_guest']} ₽ ({payment_type_text})\n"
+                f"🔢 Макс. гостей в базе: {max_guests}\n"
+                f"🆔 ID правила: {rule_id}"
+            )
+            del admin_states[message.from_user.id]
+        except ValueError:
+            await message.answer("❌ Введите корректное число!")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка при создании правила: {str(e)}")
+            print(f"Ошибка создания правила: {e}")
+            del admin_states[message.from_user.id]
+    
+    @dp.callback_query(F.data == "list_price_rules")
+    async def handle_list_price_rules(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        rules = await get_all_price_rules()
+        
+        if not rules:
+            keyboard = [
+                [InlineKeyboardButton(text="➕ Добавить правило", callback_data="add_price_rule")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="price_rules_menu")]
+            ]
+            markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await callback.message.edit_text("📋 Правил ценообразования пока нет", reply_markup=markup)
+            await callback.answer()
+            return
+        
+        text = "📋 **Правила ценообразования:**\n\n"
+        keyboard = []
+        
+        for rule in rules:
+            start_date = datetime.strptime(rule['start_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+            end_date = datetime.strptime(rule['end_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+            payment_type = "за час" if rule['extra_guest_payment_type'] == 'per_hour' else "за все время"
+            
+            text += (
+                f"📅 **{start_date} - {end_date}** ({rule['start_time']}-{rule['end_time']})\n"
+                f"💰 {rule['price_per_hour']} ₽/ч | Доп. гость: {rule['price_per_extra_guest']} ₽ ({payment_type})\n"
+                f"🔢 До {rule['max_guests_included']} чел. в базе | ID: {rule['id']}\n\n"
+            )
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"✏️ ID {rule['id']}",
+                    callback_data=f"edit_price_rule_{rule['id']}"
+                ),
+                InlineKeyboardButton(
+                    text=f"🗑 ID {rule['id']}",
+                    callback_data=f"delete_price_rule_{rule['id']}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="price_rules_menu")])
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+    
+    @dp.callback_query(F.data.regexp(r"^delete_price_rule_\d+$"))
+    async def handle_delete_price_rule(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        rule_id = int(callback.data.split("_")[3])
+        rule = await get_price_rule_by_id(rule_id)
+        
+        if not rule:
+            await callback.message.edit_text("❌ Правило не найдено")
+            await callback.answer()
+            return
+        
+        success = await delete_price_rule(rule_id)
+        
+        if success:
+            await callback.message.edit_text(f"✅ Правило ID {rule_id} успешно удалено!")
+        else:
+            await callback.message.edit_text("❌ Ошибка при удалении правила")
+        
+        await callback.answer()
+    
+    @dp.callback_query(F.data.regexp(r"^edit_price_rule_\d+$"))
+    async def handle_edit_price_rule_button(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        rule_id = int(callback.data.split("_")[3])
+        rule = await get_price_rule_by_id(rule_id)
+        
+        if not rule:
+            await callback.message.edit_text("❌ Правило не найдено")
+            await callback.answer()
+            return
+        
+        start_date = datetime.strptime(rule['start_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+        end_date = datetime.strptime(rule['end_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+        payment_type = "за все время" if rule['extra_guest_payment_type'] == 'per_booking' else "за каждый час"
+        
+        text = (
+            f"✏️ **Редактирование правила ID {rule_id}**\n\n"
+            f"📅 Период: {start_date} - {end_date}\n"
+            f"🕐 Время: {rule['start_time']} - {rule['end_time']}\n"
+            f"💰 Цена за час: {rule['price_per_hour']} ₽\n"
+            f"👥 Цена за доп. гостя: {rule['price_per_extra_guest']} ₽ ({payment_type})\n"
+            f"🔢 Макс. гостей в базе: {rule['max_guests_included']}\n\n"
+            f"Выберите, что хотите изменить:"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton(text="📅 Период (даты)", callback_data=f"edit_rule_dates_{rule_id}")],
+            [InlineKeyboardButton(text="🕐 Время", callback_data=f"edit_rule_times_{rule_id}")],
+            [InlineKeyboardButton(text="💰 Цена за час", callback_data=f"edit_rule_price_hour_{rule_id}")],
+            [InlineKeyboardButton(text="👥 Цена за доп. гостя", callback_data=f"edit_rule_price_extra_{rule_id}")],
+            [InlineKeyboardButton(text="💳 Тип доплаты", callback_data=f"edit_rule_payment_type_{rule_id}")],
+            [InlineKeyboardButton(text="🔢 Макс. гостей в базе", callback_data=f"edit_rule_max_guests_{rule_id}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="list_price_rules")]
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        await callback.message.edit_text(text, reply_markup=markup)
+        await callback.answer()
+    
+    @dp.callback_query(F.data.regexp(r"^edit_rule_(dates|times|price_hour|price_extra|payment_type|max_guests)_\d+$"))
+    async def handle_edit_price_rule_field(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        parts = callback.data.split("_")
+        field = parts[2]
+        rule_id = int(parts[3])
+        
+        rule = await get_price_rule_by_id(rule_id)
+        if not rule:
+            await callback.message.edit_text("❌ Правило не найдено")
+            await callback.answer()
+            return
+        
+        admin_states[callback.from_user.id] = {
+            "state": f"editing_price_rule_{field}",
+            "rule_id": rule_id
+        }
+        
+        if field == "dates":
+            await callback.message.edit_text(
+                "📅 Введите новый период в формате:\n"
+                "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ\n"
+                "Например: 01.12.2024 - 31.12.2024"
+            )
+        elif field == "times":
+            await callback.message.edit_text(
+                f"🕐 Введите новый временной диапазон в формате:\n"
+                f"ЧЧ:ММ - ЧЧ:ММ\n"
+                f"Например: 10:00 - 22:00\n"
+                f"Рабочее время: {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00"
+            )
+        elif field == "price_hour":
+            await callback.message.edit_text("💰 Введите новую цену за час (в рублях, число):")
+        elif field == "price_extra":
+            await callback.message.edit_text("👥 Введите новую цену за дополнительного гостя (в рублях, число):")
+        elif field == "payment_type":
+            text = "💳 Выберите тип доплаты за дополнительного гостя:"
+            keyboard = [
+                [InlineKeyboardButton(text="⏱ За все время", callback_data=f"set_payment_type_per_booking_{rule_id}")],
+                [InlineKeyboardButton(text="🕐 За каждый час", callback_data=f"set_payment_type_per_hour_{rule_id}")]
+            ]
+            markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            await callback.message.edit_text(text, reply_markup=markup)
+            await callback.answer()
+            return
+        elif field == "max_guests":
+            await callback.message.edit_text("🔢 Введите новое количество гостей, включенных в базовую цену (число):")
+        
+        await callback.answer()
+    
+    @dp.message(lambda message: admin_states.get(message.from_user.id, {}).get("state", "").startswith("editing_price_rule_"))
+    async def handle_edit_price_rule_input(message: types.Message):
+        if not await is_admin(message.from_user.id):
+            return
+        
+        state = admin_states[message.from_user.id]
+        rule_id = state["rule_id"]
+        rule_state = state["state"]
+        
+        field = rule_state.replace("editing_price_rule_", "")
+        
+        try:
+            update_params = {}
+            
+            if field == "dates":
+                text = message.text.strip()
+                if " - " not in text:
+                    await message.answer("❌ Используйте формат: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
+                    return
+                start_date_str, end_date_str = text.split(" - ", 1)
+                start_date = datetime.strptime(start_date_str.strip(), "%d.%m.%Y").strftime("%Y-%m-%d")
+                end_date = datetime.strptime(end_date_str.strip(), "%d.%m.%Y").strftime("%Y-%m-%d")
+                if end_date < start_date:
+                    await message.answer("❌ Дата окончания не может быть раньше даты начала!")
+                    return
+                update_params["start_date"] = start_date
+                update_params["end_date"] = end_date
+            
+            elif field == "times":
+                text = message.text.strip()
+                if " - " not in text:
+                    await message.answer("❌ Используйте формат: ЧЧ:ММ - ЧЧ:ММ")
+                    return
+                start_time_str, end_time_str = text.split(" - ", 1)
+                start_time = datetime.strptime(start_time_str.strip(), "%H:%M").strftime("%H:%M")
+                end_time = datetime.strptime(end_time_str.strip(), "%H:%M").strftime("%H:%M")
+                
+                start_hour = datetime.strptime(start_time, "%H:%M").hour
+                end_hour = datetime.strptime(end_time, "%H:%M").hour
+                
+                if start_hour < OPEN_HOUR or start_hour >= CLOSE_HOUR:
+                    await message.answer(f"❌ Время начала должно быть в диапазоне {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00")
+                    return
+                if end_hour < OPEN_HOUR or end_hour > CLOSE_HOUR:
+                    await message.answer(f"❌ Время окончания должно быть в диапазоне {OPEN_HOUR:02d}:00 - {CLOSE_HOUR:02d}:00")
+                    return
+                if end_time <= start_time:
+                    await message.answer(f"❌ Время окончания должно быть позже времени начала!")
+                    return
+                
+                update_params["start_time"] = start_time
+                update_params["end_time"] = end_time
+            
+            elif field == "price_hour":
+                price = int(message.text.strip())
+                if price < 0:
+                    await message.answer("❌ Цена не может быть отрицательной!")
+                    return
+                update_params["price_per_hour"] = price
+            
+            elif field == "price_extra":
+                price = int(message.text.strip())
+                if price < 0:
+                    await message.answer("❌ Цена не может быть отрицательной!")
+                    return
+                update_params["price_per_extra_guest"] = price
+            
+            elif field == "max_guests":
+                max_guests = int(message.text.strip())
+                if max_guests < 1:
+                    await message.answer("❌ Количество должно быть больше 0!")
+                    return
+                update_params["max_guests_included"] = max_guests
+            
+            success = await update_price_rule(rule_id, **update_params)
+            
+            if success:
+                rule = await get_price_rule_by_id(rule_id)
+                start_date = datetime.strptime(rule['start_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+                end_date = datetime.strptime(rule['end_date'], "%Y-%m-%d").strftime("%d.%m.%Y")
+                payment_type = "за все время" if rule['extra_guest_payment_type'] == 'per_booking' else "за каждый час"
+                
+                await message.answer(
+                    f"✅ Правило успешно обновлено!\n\n"
+                    f"📅 Период: {start_date} - {end_date}\n"
+                    f"🕐 Время: {rule['start_time']} - {rule['end_time']}\n"
+                    f"💰 Цена за час: {rule['price_per_hour']} ₽\n"
+                    f"👥 Цена за доп. гостя: {rule['price_per_extra_guest']} ₽ ({payment_type})\n"
+                    f"🔢 Макс. гостей в базе: {rule['max_guests_included']}"
+                )
+            else:
+                await message.answer("❌ Ошибка при обновлении правила")
+            
+            del admin_states[message.from_user.id]
+        
+        except ValueError as e:
+            if field == "dates":
+                await message.answer("❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
+            elif field == "times":
+                await message.answer("❌ Неверный формат времени. Используйте формат ЧЧ:ММ - ЧЧ:ММ")
+            else:
+                await message.answer(f"❌ Ошибка: {str(e)}")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка при обновлении правила: {str(e)}")
+            print(f"Ошибка обновления правила: {e}")
+            del admin_states[message.from_user.id]
+    
+    @dp.callback_query(F.data.regexp(r"^set_payment_type_(per_booking|per_hour)_\d+$"))
+    async def handle_set_payment_type(callback: types.CallbackQuery):
+        if not await is_admin(callback.from_user.id):
+            return
+        
+        parts = callback.data.split("_")
+        payment_type = "per_booking" if parts[3] == "per" else "per_hour"
+        rule_id = int(parts[4])
+        
+        success = await update_price_rule(rule_id, extra_guest_payment_type=payment_type)
+        
+        if success:
+            payment_type_text = "за все время" if payment_type == "per_booking" else "за каждый час"
+            await callback.message.edit_text(f"✅ Тип доплаты изменен на: {payment_type_text}")
+        else:
+            await callback.message.edit_text("❌ Ошибка при обновлении типа доплаты")
+        
+        await callback.answer()
 
     # Обработчики управления расходами
     @dp.message(F.text == "📉 Расходы")
